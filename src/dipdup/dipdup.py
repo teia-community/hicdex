@@ -1,49 +1,70 @@
 import asyncio
-import hashlib
 import logging
-import operator
-from collections import Counter
-from contextlib import AsyncExitStack, asynccontextmanager, suppress
-from functools import reduce
-from os import listdir
-from os.path import join
-from typing import Dict, List, Optional, cast
+from asyncio import CancelledError
+from asyncio import Event
+from asyncio import Task
+from asyncio import create_task
+from asyncio import gather
+from collections import deque
+from contextlib import AsyncExitStack
+from contextlib import asynccontextmanager
+from contextlib import suppress
+from typing import Awaitable
+from typing import Deque
+from typing import Dict
+from typing import List
+from typing import Optional
+from typing import Set
+from typing import Tuple
+from typing import cast
 
-import sqlparse  # type: ignore
-from genericpath import exists
-from tortoise import Tortoise
+from apscheduler.events import EVENT_JOB_ERROR  # type: ignore
+from prometheus_client import start_http_server  # type: ignore
 from tortoise.exceptions import OperationalError
 from tortoise.transactions import get_connection
-from tortoise.utils import get_schema_sql
 
 from dipdup.codegen import DipDupCodeGenerator
-from dipdup.config import (
-    ROLLBACK_HANDLER,
-    BcdDatasourceConfig,
-    BigMapIndexConfig,
-    CoinbaseDatasourceConfig,
-    ContractConfig,
-    DatasourceConfigT,
-    DipDupConfig,
-    IndexConfigTemplateT,
-    IndexTemplateConfig,
-    OperationIndexConfig,
-    PostgresDatabaseConfig,
-    TzktDatasourceConfig,
-)
-from dipdup.context import DipDupContext, RollbackHandlerContext
-from dipdup.datasources.bcd.datasource import BcdDatasource
-from dipdup.datasources.coinbase.datasource import CoinbaseDatasource
-from dipdup.datasources.datasource import Datasource, IndexDatasource
+from dipdup.config import ContractConfig
+from dipdup.config import DatasourceConfigT
+from dipdup.config import DipDupConfig
+from dipdup.config import IndexTemplateConfig
+from dipdup.config import OperationIndexConfig
+from dipdup.config import PostgresDatabaseConfig
+from dipdup.config import default_hooks
+from dipdup.context import CallbackManager
+from dipdup.context import DipDupContext
+from dipdup.context import MetadataCursor
+from dipdup.context import pending_indexes
+from dipdup.datasources.datasource import Datasource
+from dipdup.datasources.datasource import IndexDatasource
+from dipdup.datasources.factory import DatasourceFactory
 from dipdup.datasources.tzkt.datasource import TzktDatasource
-from dipdup.exceptions import ConfigurationError, ReindexingRequiredError
+from dipdup.enums import ReindexingReason
+from dipdup.exceptions import ConfigInitializationException
+from dipdup.exceptions import DipDupException
 from dipdup.hasura import HasuraGateway
-from dipdup.index import BigMapIndex, Index, OperationIndex
-from dipdup.models import BigMapData, HeadBlockData, IndexType, OperationData, State
-from dipdup.utils import FormattedLogger, iter_files, slowdown, tortoise_wrapper
-
-INDEX_DISPATCHER_INTERVAL = 1.0
-from dipdup.scheduler import add_job, create_scheduler
+from dipdup.index import BigMapIndex
+from dipdup.index import HeadIndex
+from dipdup.index import Index
+from dipdup.index import OperationIndex
+from dipdup.index import extract_operation_subgroups
+from dipdup.models import BigMapData
+from dipdup.models import Contract
+from dipdup.models import Head
+from dipdup.models import HeadBlockData
+from dipdup.models import Index as IndexState
+from dipdup.models import IndexStatus
+from dipdup.models import OperationData
+from dipdup.models import Schema
+from dipdup.prometheus import Metrics
+from dipdup.scheduler import add_job
+from dipdup.scheduler import create_scheduler
+from dipdup.utils import slowdown
+from dipdup.utils.database import generate_schema
+from dipdup.utils.database import get_schema_hash
+from dipdup.utils.database import prepare_models
+from dipdup.utils.database import tortoise_wrapper
+from dipdup.utils.database import validate_models
 
 
 class IndexDispatcher:
@@ -52,122 +73,233 @@ class IndexDispatcher:
 
         self._logger = logging.getLogger('dipdup')
         self._indexes: Dict[str, Index] = {}
-        self._stopped: bool = False
+        self._tasks: Deque[asyncio.Task] = deque()
 
-    async def add_index(self, index_config: IndexConfigTemplateT) -> None:
-        if index_config.name in self._indexes:
-            return
-        self._logger.info('Adding index `%s` to dispatcher', index_config.name)
-        if isinstance(index_config, OperationIndexConfig):
-            datasource_name = cast(TzktDatasourceConfig, index_config.datasource).name
-            datasource = self._ctx.datasources[datasource_name]
-            if not isinstance(datasource, TzktDatasource):
-                raise RuntimeError(f'`{datasource_name}` is not a TzktDatasource')
-            operation_index = OperationIndex(self._ctx, index_config, datasource)
-            self._indexes[index_config.name] = operation_index
-            await datasource.add_index(index_config)
+        self._entrypoint_filter: Set[Optional[str]] = set()
+        self._address_filter: Set[str] = set()
 
-        elif isinstance(index_config, BigMapIndexConfig):
-            datasource_name = cast(TzktDatasourceConfig, index_config.datasource).name
-            datasource = self._ctx.datasources[datasource_name]
-            if not isinstance(datasource, TzktDatasource):
-                raise RuntimeError(f'`{datasource_name}` is not a TzktDatasource')
-            big_map_index = BigMapIndex(self._ctx, index_config, datasource)
-            self._indexes[index_config.name] = big_map_index
-            await datasource.add_index(index_config)
+    async def run(self, spawn_datasources_event: Event, start_scheduler_event: Event, early_realtime: bool = False) -> None:
+        tasks = [self._run(spawn_datasources_event, start_scheduler_event, early_realtime)]
+        if self._ctx.config.prometheus:
+            tasks.append(self._update_metrics(self._ctx.config.prometheus.update_interval))
+        await gather(*tasks)
 
-        else:
-            raise NotImplementedError
-
-    async def reload_config(self) -> None:
-        if not self._ctx.updated:
-            return
-
-        self._logger.info('Reloading config')
-        self._ctx.config.initialize()
-
-        for index_config in self._ctx.config.indexes.values():
-            if isinstance(index_config, IndexTemplateConfig):
-                raise RuntimeError('Config is not initialized')
-            await self.add_index(index_config)
-
-        self._ctx.reset()
-
-        contracts = [index._config.contracts for index in self._indexes.values() if index._config.contracts]
-        if not contracts:
-            return
-
-        plain_contracts = reduce(operator.add, contracts)
-        duplicate_contracts = [cast(ContractConfig, item).name for item, count in Counter(plain_contracts).items() if count > 1]
-        if duplicate_contracts:
-            self._logger.warning(
-                "The following contracts are used in more than one index: %s. Make sure you know what you're doing.",
-                ' '.join(duplicate_contracts),
-            )
-
-    async def dispatch_operations(self, datasource: TzktDatasource, operations: List[OperationData], block: HeadBlockData) -> None:
-        assert len(set(op.level for op in operations)) == 1
-        level = operations[0].level
-        for index in self._indexes.values():
-            if isinstance(index, OperationIndex) and index.datasource == datasource:
-                index.push(level, operations, block)
-
-    async def dispatch_big_maps(self, datasource: TzktDatasource, big_maps: List[BigMapData], block: HeadBlockData) -> None:
-        assert len(set(op.level for op in big_maps)) == 1
-        level = big_maps[0].level
-        for index in self._indexes.values():
-            if isinstance(index, BigMapIndex) and index.datasource == datasource:
-                index.push(level, big_maps, block)
-
-    async def _rollback(self, datasource: TzktDatasource, from_level: int, to_level: int) -> None:
-        logger = FormattedLogger(ROLLBACK_HANDLER)
-        if from_level - to_level == 1:
-            # NOTE: Single level rollbacks are processed at Index level.
-            # NOTE: Notify all indexes which use rolled back datasource to drop duplicated operations from the next block
-            for index in self._indexes.values():
-                if index.datasource == datasource:
-                    # NOTE: Continue to rollback with handler
-                    if not isinstance(index, OperationIndex):
-                        self._logger.info('Single level rollback is not supported by `%s` indexes', index._config.kind)
-                        break
-                    await index.single_level_rollback(from_level)
-            else:
-                return
-
-        rollback_fn = self._ctx.config.get_rollback_fn()
-        ctx = RollbackHandlerContext(
-            config=self._ctx.config,
-            datasources=self._ctx.datasources,
-            logger=logger,
-            datasource=datasource,
-            from_level=from_level,
-            to_level=to_level,
-        )
-        await rollback_fn(ctx)
-
-    async def run(self, oneshot=False) -> None:
+    async def _run(self, spawn_datasources_event: Event, start_scheduler_event: Event, early_realtime: bool = False) -> None:
         self._logger.info('Starting index dispatcher')
+        await self._subscribe_to_datasource_events()
+        await self._load_index_states()
+
+        on_synchronized_fired = False
+
+        for index in self._indexes.values():
+            if isinstance(index, OperationIndex):
+                self._apply_filters(index._config)
+
+        while True:
+            if not spawn_datasources_event.is_set():
+                if self._every_index_is(IndexStatus.REALTIME) or early_realtime:
+                    spawn_datasources_event.set()
+
+            if spawn_datasources_event.is_set():
+                index_datasources = {i.datasource for i in self._indexes.values()}
+                for datasource in index_datasources:
+                    await datasource.subscribe()
+
+            tasks: Deque[Awaitable] = deque(index.process() for index in self._indexes.values())
+            while self._tasks:
+                tasks.append(self._tasks.popleft())
+
+            async with slowdown(1):
+                await gather(*tasks)
+
+            indexes_spawned = False
+            while pending_indexes:
+                index = pending_indexes.popleft()
+                self._indexes[index._config.name] = index
+                indexes_spawned = True
+
+                if isinstance(index, OperationIndex):
+                    self._apply_filters(index._config)
+
+            if not indexes_spawned and self._every_index_is(IndexStatus.ONESHOT):
+                break
+
+            if self._every_index_is(IndexStatus.REALTIME) and not indexes_spawned:
+                if not on_synchronized_fired:
+                    on_synchronized_fired = True
+                    await self._ctx.fire_hook('on_synchronized')
+
+                if not start_scheduler_event.is_set():
+                    start_scheduler_event.set()
+            # NOTE: Fire `on_synchronized` hook when indexes will reach realtime state again
+            else:
+                on_synchronized_fired = False
+
+    async def _update_metrics(self, update_interval: float) -> None:
+        while True:
+            await asyncio.sleep(update_interval)
+
+            active, synced, realtime = 0, 0, 0
+            for index in tuple(self._indexes.values()) + tuple(pending_indexes):
+                active += 1
+                if index.synchronized:
+                    synced += 1
+                if index.realtime:
+                    realtime += 1
+
+            Metrics.set_indexes_count(active, synced, realtime)
+
+    def _apply_filters(self, index_config: OperationIndexConfig) -> None:
+        self._address_filter.update(index_config.address_filter)
+        self._entrypoint_filter.update(index_config.entrypoint_filter)
+
+    def _every_index_is(self, status: IndexStatus) -> bool:
+        if not self._indexes:
+            return False
+
+        statuses = {i.state.status for i in self._indexes.values()}
+        return statuses == {status}
+
+    async def _fetch_contracts(self) -> None:
+        """Add contracts spawned from context to config"""
+        contracts = await Contract.filter().all()
+        self._logger.info('%s contracts fetched from database', len(contracts))
+
+        for contract in contracts:
+            if contract.name not in self._ctx.config.contracts:
+                contract_config = ContractConfig(address=contract.address, typename=contract.typename)
+                self._ctx.config.contracts[contract.name] = contract_config
+        self._ctx.config.initialize(skip_imports=True)
+
+    async def _subscribe_to_datasource_events(self) -> None:
         for datasource in self._ctx.datasources.values():
             if not isinstance(datasource, IndexDatasource):
                 continue
-            datasource.on_operations(self.dispatch_operations)
-            datasource.on_big_maps(self.dispatch_big_maps)
-            datasource.on_rollback(self._rollback)
+            # NOTE: No need to subscribe to head, handled by datasource itself
+            # FIXME: mypy tricks, ignore first argument
+            datasource.on_head(self._on_head)  # type: ignore
+            datasource.on_operations(self._on_operations)  # type: ignore
+            datasource.on_big_maps(self._on_big_maps)  # type: ignore
+            datasource.on_rollback(self._on_rollback)  # type: ignore
 
-        self._ctx.commit()
+    async def _load_index_states(self) -> None:
+        if self._indexes:
+            raise RuntimeError('Index states are already loaded')
 
-        while not self._stopped:
-            await self.reload_config()
+        await self._fetch_contracts()
+        self._logger.info('%s indexes found in database', await IndexState.all().count())
 
-            async with slowdown(INDEX_DISPATCHER_INTERVAL):
-                await asyncio.gather(*[index.process() for index in self._indexes.values()])
+        async def _process(index_state: IndexState) -> None:
+            name, template, template_values = index_state.name, index_state.template, index_state.template_values
 
-            # TODO: Continue if new indexes are spawned from origination
-            if oneshot:
-                break
+            # NOTE: Index in config (templates are already resolved): just verify hash
+            if index_config := self._ctx.config.indexes.get(name):
+                if isinstance(index_config, IndexTemplateConfig):
+                    raise ConfigInitializationException
 
-    def stop(self) -> None:
-        self._stopped = True
+                new_hash = index_config.hash()
+                if not index_state.config_hash:
+                    index_state.config_hash = new_hash  # type: ignore
+                    await index_state.save()
+                elif new_hash != index_state.config_hash:
+                    await self._ctx.reindex(
+                        ReindexingReason.config_modified,
+                        old_hash=index_state.config_hash,
+                        new_hash=new_hash,
+                    )
+
+            # NOTE: Templated index: recreate index config, verify hash
+            elif template:
+                if template not in self._ctx.config.templates:
+                    await self._ctx.reindex(
+                        ReindexingReason.config_modified,
+                        index_name=index_state.name,
+                        template=template,
+                    )
+                await self._ctx.add_index(name, template, template_values, index_state)
+
+            # NOTE: Index config is missing, possibly just commented-out
+            else:
+                self._logger.warning('Index `%s` was removed from config, ignoring', name)
+
+        tasks = (create_task(_process(index_state)) for index_state in await IndexState.all())
+        await gather(*tasks)
+
+    async def _on_head(self, datasource: TzktDatasource, head: HeadBlockData) -> None:
+        # NOTE: Do not await query results - blocked database connection may cause Websocket timeout.
+        self._tasks.append(
+            asyncio.create_task(
+                Head.update_or_create(
+                    name=datasource.name,
+                    defaults={
+                        'level': head.level,
+                        'hash': head.hash,
+                        'timestamp': head.timestamp,
+                    },
+                ),
+            )
+        )
+        if Metrics.enabled:
+            Metrics.set_datasource_head_updated(datasource.name)
+        for index in self._indexes.values():
+            if isinstance(index, HeadIndex) and index.datasource == datasource:
+                index.push_head(head)
+
+    async def _on_operations(self, datasource: TzktDatasource, operations: Tuple[OperationData, ...]) -> None:
+        operation_subgroups = tuple(
+            extract_operation_subgroups(
+                operations,
+                entrypoints=self._entrypoint_filter,
+                addresses=self._address_filter,
+            )
+        )
+
+        if not operation_subgroups:
+            return
+
+        operation_indexes = (i for i in self._indexes.values() if isinstance(i, OperationIndex) and i.datasource == datasource)
+        for index in operation_indexes:
+            index.push_operations(operation_subgroups)
+
+    async def _on_big_maps(self, datasource: TzktDatasource, big_maps: Tuple[BigMapData]) -> None:
+        big_map_indexes = (i for i in self._indexes.values() if isinstance(i, BigMapIndex) and i.datasource == datasource)
+        for index in big_map_indexes:
+            index.push_big_maps(big_maps)
+
+    async def _on_rollback(self, datasource: TzktDatasource, from_level: int, to_level: int) -> None:
+        """Perform a single level rollback when possible, otherwise call `on_rollback` hook"""
+        self._logger.warning('Datasource `%s` rolled back: %s -> %s', datasource.name, from_level, to_level)
+        if Metrics.enabled:
+            Metrics.set_datasource_rollback(datasource.name)
+
+        # NOTE: Zero difference between levels means we received no operations/big_maps on this level and thus channel level hasn't changed
+        zero_level_rollback = from_level - to_level == 0
+        single_level_rollback = from_level - to_level == 1
+
+        if zero_level_rollback:
+            self._logger.info('Zero level rollback, ignoring')
+
+        elif single_level_rollback:
+            # NOTE: Notify all indexes which use rolled back datasource to drop duplicated operations from the next block
+            self._logger.info('Checking if single level rollback is possible')
+            matching_indexes = tuple(i for i in self._indexes.values() if i.datasource == datasource)
+            matching_operation_indexes = tuple(i for i in matching_indexes if isinstance(i, OperationIndex))
+            self._logger.info(
+                'Indexes: %s total, %s matching, %s support single level rollback',
+                len(self._indexes),
+                len(matching_indexes),
+                len(matching_operation_indexes),
+            )
+
+            all_indexes_are_operation = len(matching_indexes) == len(matching_operation_indexes)
+            if all_indexes_are_operation:
+                for index in cast(List[OperationIndex], matching_indexes):
+                    index.push_rollback(from_level)
+            else:
+                await self._ctx.fire_hook('on_rollback', datasource=datasource, from_level=from_level, to_level=to_level)
+
+        else:
+            await self._ctx.fire_hook('on_rollback', datasource=datasource, from_level=from_level, to_level=to_level)
 
 
 class DipDup:
@@ -180,15 +312,23 @@ class DipDup:
         self._config = config
         self._datasources: Dict[str, Datasource] = {}
         self._datasources_by_config: Dict[DatasourceConfigT, Datasource] = {}
+        self._callbacks: CallbackManager = CallbackManager(self._config.package)
         self._ctx = DipDupContext(
             config=self._config,
             datasources=self._datasources,
+            callbacks=self._callbacks,
         )
-        self._index_dispatcher = IndexDispatcher(self._ctx)
-        self._scheduler = create_scheduler()
+        self._scheduler = create_scheduler(self._config.advanced.scheduler)
         self._codegen = DipDupCodeGenerator(self._config, self._datasources_by_config)
+        self._schema: Optional[Schema] = None
 
-    async def init(self) -> None:
+    @property
+    def schema(self) -> Schema:
+        if self._schema is None:
+            raise DipDupException('Schema is not initialized')
+        return self._schema
+
+    async def init(self, overwrite_types: bool = False, keep_schemas: bool = False) -> None:
         """Create new or update existing dipdup project"""
         await self._create_datasources()
 
@@ -196,185 +336,230 @@ class DipDup:
             for datasource in self._datasources.values():
                 await stack.enter_async_context(datasource)
 
-            await self._codegen.init()
+            await self._codegen.init(overwrite_types, keep_schemas)
 
-    async def docker_init(self, image: str, tag: str, env_file: str) -> None:
-        await self._codegen.docker_init(image, tag, env_file)
-
-    async def run(self, reindex: bool, oneshot: bool) -> None:
-        """Main entrypoint"""
-
-        url = self._config.database.connection_string
-        models = f'{self._config.package}.models'
-
-        await self._create_datasources(realtime=not oneshot)
-
-        hasura_gateway: Optional[HasuraGateway]
-        if self._config.hasura:
-            if not isinstance(self._config.database, PostgresDatabaseConfig):
-                raise RuntimeError
-            hasura_gateway = HasuraGateway(self._config.package, self._config.hasura, self._config.database)
-        else:
-            hasura_gateway = None
-
+    async def run(self) -> None:
+        """Run indexing process"""
+        advanced_config = self._config.advanced
+        tasks: Set[Task] = set()
         async with AsyncExitStack() as stack:
-            worker_tasks = []
-            await stack.enter_async_context(tortoise_wrapper(url, models))
+            stack.enter_context(suppress(KeyboardInterrupt, CancelledError))
+            await self._set_up_database(stack)
+            await self._set_up_datasources(stack)
+            await self._set_up_hooks(tasks)
+            await self._set_up_prometheus()
 
-            await self._initialize_database(reindex)
-            for datasource in self._datasources.values():
-                await stack.enter_async_context(datasource)
+            await self._initialize_schema()
+            await self._initialize_datasources()
+            await self._set_up_hasura(stack)
 
-            # NOTE: on_configure hook fires after database and datasources are initialized but before Hasura is
-            await self._on_configure()
+            if advanced_config.metadata_interface:
+                await MetadataCursor.initialize()
 
-            if hasura_gateway:
-                await stack.enter_async_context(hasura_gateway)
-                worker_tasks.append(asyncio.create_task(hasura_gateway.configure()))
+            if self._config.oneshot:
+                start_scheduler_event, spawn_datasources_event = Event(), Event()
+            else:
+                start_scheduler_event = await self._set_up_scheduler(stack, tasks)
+                if not advanced_config.postpone_jobs:
+                    start_scheduler_event.set()
+                spawn_datasources_event = await self._spawn_datasources(tasks)
 
-            self._logger.info('Starting datasources')
-            datasource_tasks = [] if oneshot else [asyncio.create_task(d.run()) for d in self._datasources.values()]
+            spawn_index_tasks = (create_task(self._ctx.spawn_index(name)) for name in self._config.indexes)
+            await gather(*spawn_index_tasks)
 
-            if self._config.jobs and not oneshot:
-                await stack.enter_async_context(self._scheduler_context())
-                for job_name, job_config in self._config.jobs.items():
-                    add_job(self._ctx, self._scheduler, job_name, job_config)
+            await self._set_up_index_dispatcher(tasks, spawn_datasources_event, start_scheduler_event, advanced_config.early_realtime)
 
-            worker_tasks.append(asyncio.create_task(self._index_dispatcher.run(oneshot)))
+            await gather(*tasks)
 
-            try:
-                await asyncio.gather(*datasource_tasks, *worker_tasks)
-            except KeyboardInterrupt:
-                pass
-            except GeneratorExit:
-                pass
-
-    async def migrate_to_v10(self) -> None:
-        codegen = DipDupCodeGenerator(self._config, self._datasources_by_config)
-        await codegen.generate_default_handlers(recreate=True)
-        await codegen.migrate_user_handlers_to_v10()
-        self._finish_migration('1.0')
-
-    async def migrate_to_v11(self) -> None:
-        codegen = DipDupCodeGenerator(self._config, self._datasources_by_config)
-        await codegen.migrate_user_handlers_to_v11()
-        self._finish_migration('1.1')
-
-    async def _on_configure(self) -> None:
-        """Run user-defined initial configuration handler"""
-        configure_fn = self._config.get_configure_fn()
-        await configure_fn(self._ctx)
-        self._config.initialize()
-
-    async def _create_datasources(self, realtime: bool = True) -> None:
+    async def _create_datasources(self) -> None:
         datasource: Datasource
         for name, datasource_config in self._config.datasources.items():
             if name in self._datasources:
                 continue
 
-            if isinstance(datasource_config, TzktDatasourceConfig):
-                datasource = TzktDatasource(
-                    url=datasource_config.url,
-                    http_config=datasource_config.http,
-                )
-            elif isinstance(datasource_config, BcdDatasourceConfig):
-                datasource = BcdDatasource(
-                    url=datasource_config.url,
-                    network=datasource_config.network,
-                    http_config=datasource_config.http,
-                )
-            elif isinstance(datasource_config, CoinbaseDatasourceConfig):
-                datasource = CoinbaseDatasource(
-                    http_config=datasource_config.http,
-                )
-            else:
-                raise NotImplementedError
+            datasource = DatasourceFactory.build(name, self._config)
 
-            datasource._logger = FormattedLogger(datasource._logger.name, datasource_config.name + ': {}')
-            datasource.set_user_agent(self._config.package)
             self._datasources[name] = datasource
             self._datasources_by_config[datasource_config] = datasource
 
-    async def _initialize_database(self, reindex: bool = False) -> None:
-        self._logger.info('Initializing database')
+    async def _initialize_schema(self) -> None:
+        self._logger.info('Initializing database schema')
+        schema_name = self._config.schema_name
+        conn = get_connection(None)
 
-        if isinstance(self._config.database, PostgresDatabaseConfig) and self._config.database.schema_name:
-            await Tortoise._connections['default'].execute_script(f"CREATE SCHEMA IF NOT EXISTS {self._config.database.schema_name}")
-            await Tortoise._connections['default'].execute_script(f"SET search_path TO {self._config.database.schema_name}")
-
-        if reindex:
-            self._logger.warning('Started with `--reindex` argument, reindexing - IGNORED')
-            #await self._ctx.reindex()
-
-        self._logger.info('Checking database schema')
-        connection_name, connection = next(iter(Tortoise._connections.items()))
-
+        # NOTE: Try to fetch existing schema
         try:
-            schema_state = await State.get_or_none(index_type=IndexType.schema, index_name=connection_name)
+            self._schema = await Schema.get_or_none(name=schema_name)
+
+        # NOTE: No such table yet
         except OperationalError:
-            schema_state = None
-        # TODO: Process exception in Tortoise
-        except KeyError as e:
-            raise ReindexingRequiredError(None) from e
+            self._schema = None
 
-        schema_sql = get_schema_sql(connection, False)
+        # TODO: Fix Tortoise ORM to raise more specific exception
+        except KeyError:
+            try:
+                self._schema = await Schema.get_or_none(name=schema_name)
+            except KeyError:
+                await self._ctx.reindex(ReindexingReason.schema_modified)
 
-        # NOTE: Column order could differ in two generated schemas for the same models, drop commas and sort strings to eliminate this
-        processed_schema_sql = '\n'.join(sorted(schema_sql.replace(',', '').split('\n'))).encode()
-        schema_hash = hashlib.sha256(processed_schema_sql).hexdigest()
+        # NOTE: Call even if Schema is present; there may be new tables
+        await generate_schema(conn, schema_name)
+        schema_hash = get_schema_hash(conn)
 
-        # NOTE: `State.index_hash` field contains schema hash when `index_type` is `IndexType.schema`
-        if schema_state is None:
-            await Tortoise.generate_schemas()
-            await self._execute_sql_scripts(reindex=True)
+        if self._schema is None:
+            await self._ctx.fire_hook('on_reindex')
 
-            schema_state = State(
-                index_type=IndexType.schema,
-                index_name=connection_name,
-                index_hash=schema_hash,
+            self._schema = Schema(
+                name=schema_name,
+                hash=schema_hash,
             )
-            await schema_state.save()
-        elif schema_state.index_hash != schema_hash:
-            self._logger.error('Schema hash mismatch detected, - IGNORED')
-            # await self._ctx.reindex()
+            try:
+                await self._schema.save()
+            except OperationalError:
+                await self._ctx.reindex(ReindexingReason.schema_modified)
 
-        await self._execute_sql_scripts(reindex=False)
+        elif not self._schema.hash:
+            self._schema.hash = schema_hash  # type: ignore
+            await self._schema.save()
 
-    async def _execute_sql_scripts(self, reindex: bool) -> None:
-        """Execute SQL included with project"""
-        sql_path = join(self._config.package_path, 'sql')
-        if not exists(sql_path):
+        elif self._schema.hash != schema_hash:
+            await self._ctx.reindex(ReindexingReason.schema_modified)
+
+        elif self._schema.reindex:
+            await self._ctx.reindex(self._schema.reindex)
+
+        await self._ctx.fire_hook('on_restart')
+
+    async def _set_up_database(self, stack: AsyncExitStack) -> None:
+        # NOTE: Must be called before entering Tortoise context
+        prepare_models(self._config.package)
+        validate_models(self._config.package)
+
+        url = self._config.database.connection_string
+        timeout = self._config.database.connection_timeout if isinstance(self._config.database, PostgresDatabaseConfig) else None
+        models = f'{self._config.package}.models'
+        await stack.enter_async_context(tortoise_wrapper(url, models, timeout or 60))
+
+    async def _set_up_hooks(self, tasks: Optional[Set[Task]] = None) -> None:
+        for hook_config in default_hooks.values():
+            self._ctx.callbacks.register_hook(hook_config)
+        for hook_config in self._config.hooks.values():
+            self._ctx.callbacks.register_hook(hook_config)
+        if tasks:
+            tasks.add(create_task(self._ctx.callbacks.run()))
+
+    async def _set_up_prometheus(self) -> None:
+        if self._config.prometheus:
+            Metrics.enabled = True
+            start_http_server(self._config.prometheus.port, self._config.prometheus.host)
+
+    async def _set_up_hasura(self, stack: AsyncExitStack) -> None:
+        if not self._config.hasura:
             return
-        if any(map(lambda p: p not in ('on_reindex', 'on_restart'), listdir(sql_path))):
-            raise ConfigurationError(
-                f'SQL scripts must be placed either to `{self._config.package}/sql/on_restart` or to `{self._config.package}/sql/on_reindex` directory'
-            )
+
         if not isinstance(self._config.database, PostgresDatabaseConfig):
-            self._logger.warning('Execution of user SQL scripts is supported on PostgreSQL only, skipping')
-            return
+            raise RuntimeError
+        hasura_gateway = HasuraGateway(self._config.package, self._config.hasura, self._config.database)
+        await stack.enter_async_context(hasura_gateway)
+        await hasura_gateway.configure()
 
-        sql_path = join(sql_path, 'on_reindex' if reindex else 'on_restart')
-        if not exists(sql_path):
-            return
-        self._logger.info('Executing SQL scripts from `%s`', sql_path)
-        for file in iter_files(sql_path, '.sql'):
-            self._logger.info('Executing `%s`', file.name)
-            sql = file.read()
-            for statement in sqlparse.split(sql):
-                # NOTE: Ignore empty statements
-                with suppress(AttributeError):
-                    await get_connection(None).execute_script(statement)
+    async def _set_up_datasources(self, stack: AsyncExitStack) -> None:
+        await self._create_datasources()
+        for datasource in self._datasources.values():
+            await stack.enter_async_context(datasource)
 
-    def _finish_migration(self, version: str) -> None:
-        self._logger.warning('==================== WARNING =====================')
-        self._logger.warning('Your project has been migrated to spec version %s.', version)
-        self._logger.warning('Review and commit changes before proceeding.')
-        self._logger.warning('==================== WARNING =====================')
+    async def _initialize_datasources(self) -> None:
+        for datasource in self._datasources.values():
+            if not isinstance(datasource, TzktDatasource):
+                continue
 
-    @asynccontextmanager
-    async def _scheduler_context(self):
-        self._scheduler.start()
-        try:
-            yield
-        finally:
-            self._scheduler.shutdown()
+            head_block = await datasource.get_head_block()
+            datasource.set_network(head_block.chain)
+            datasource.set_sync_level(
+                subscription=None,
+                level=head_block.level,
+            )
+
+            db_head = await Head.filter(name=datasource.name).first()
+            if not db_head:
+                continue
+
+            actual_head = await datasource.get_block(db_head.level)
+            if db_head.hash != actual_head.hash:
+                await self._ctx.reindex(
+                    ReindexingReason.rollback,
+                    hash=db_head.hash,
+                    actual_hash=actual_head.hash,
+                )
+
+    async def _set_up_index_dispatcher(
+        self,
+        tasks: Set[Task],
+        spawn_datasources_event: Event,
+        start_scheduler_event: Event,
+        early_realtime: bool,
+    ) -> None:
+        index_dispatcher = IndexDispatcher(self._ctx)
+        tasks.add(
+            create_task(
+                index_dispatcher.run(
+                    spawn_datasources_event,
+                    start_scheduler_event,
+                    early_realtime,
+                )
+            )
+        )
+
+    async def _spawn_datasources(self, tasks: Set[Task]) -> Event:
+        event = Event()
+
+        async def _event_wrapper():
+            self._logger.info('Waiting for indexes to synchronize before spawning datasources')
+            await event.wait()
+
+            self._logger.info('Spawning datasources')
+            _tasks = [create_task(d.run()) for d in self._datasources.values()]
+            await gather(*_tasks)
+
+        tasks.add(create_task(_event_wrapper()))
+        return event  # noqa: R504
+
+    async def _set_up_scheduler(self, stack: AsyncExitStack, tasks: Set[Task]) -> Event:
+        job_failed = Event()
+        event = Event()
+        exception: Optional[Exception] = None
+
+        @asynccontextmanager
+        async def _context():
+            try:
+                self._scheduler.start()
+                yield
+            finally:
+                self._scheduler.shutdown()
+
+        def _error_hook(event) -> None:
+            nonlocal job_failed, exception
+            exception = event.exception
+            job_failed.set()
+
+        async def _watchdog() -> None:
+            nonlocal job_failed
+            await job_failed.wait()
+            if not isinstance(exception, Exception):
+                raise RuntimeError
+            raise exception
+
+        async def _event_wrapper():
+            self._logger.info('Waiting for an event to start scheduler')
+            await event.wait()
+
+            self._logger.info('Starting scheduler')
+            self._scheduler.add_listener(_error_hook, EVENT_JOB_ERROR)
+            await stack.enter_async_context(_context())
+            tasks.add(create_task(_watchdog()))
+
+            for job_config in self._config.jobs.values():
+                add_job(self._ctx, self._scheduler, job_config)
+
+        tasks.add(create_task(_event_wrapper()))
+        return event  # noqa: R504

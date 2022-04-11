@@ -1,71 +1,226 @@
-import time
+import logging
 from abc import abstractmethod
-from collections import defaultdict, deque, namedtuple
-from contextlib import suppress
-from typing import Deque, Dict, List, Optional, Set, Tuple, Union, cast
+from collections import defaultdict
+from collections import deque
+from collections import namedtuple
+from contextlib import ExitStack
+from datetime import datetime
+from typing import DefaultDict
+from typing import Deque
+from typing import Dict
+from typing import Iterable
+from typing import Iterator
+from typing import Optional
+from typing import Sequence
+from typing import Set
+from typing import Tuple
+from typing import Union
+from typing import cast
 
+from pydantic.dataclasses import dataclass
 from pydantic.error_wrappers import ValidationError
 
-from dipdup.config import (
-    BigMapHandlerConfig,
-    BigMapIndexConfig,
-    ContractConfig,
-    IndexConfigTemplateT,
-    OperationHandlerConfig,
-    OperationHandlerOriginationPatternConfig,
-    OperationHandlerPatternConfigT,
-    OperationHandlerTransactionPatternConfig,
-    OperationIndexConfig,
-    OperationType,
-)
-from dipdup.context import DipDupContext, HandlerContext
-from dipdup.datasources.tzkt.datasource import BigMapFetcher, OperationFetcher, TzktDatasource
+import dipdup.models as models
+from dipdup.config import BigMapHandlerConfig
+from dipdup.config import BigMapIndexConfig
+from dipdup.config import ContractConfig
+from dipdup.config import HeadHandlerConfig
+from dipdup.config import HeadIndexConfig
+from dipdup.config import OperationHandlerConfig
+from dipdup.config import OperationHandlerOriginationPatternConfig
+from dipdup.config import OperationHandlerPatternConfigT
+from dipdup.config import OperationHandlerTransactionPatternConfig
+from dipdup.config import OperationIndexConfig
+from dipdup.config import OperationType
+from dipdup.config import ResolvedIndexConfigT
+from dipdup.config import SkipHistory
+from dipdup.context import DipDupContext
+from dipdup.datasources.tzkt.datasource import BigMapFetcher
+from dipdup.datasources.tzkt.datasource import OperationFetcher
+from dipdup.datasources.tzkt.datasource import TzktDatasource
+from dipdup.datasources.tzkt.models import deserialize_storage
+from dipdup.exceptions import ConfigInitializationException
+from dipdup.exceptions import ConfigurationError
 from dipdup.exceptions import InvalidDataError
-from dipdup.models import BigMapData, BigMapDiff, HeadBlockData, OperationData, Origination, State, TemporaryState, Transaction
-from dipdup.utils import FormattedLogger, in_global_transaction
+from dipdup.exceptions import ReindexingReason
+from dipdup.models import BigMapAction
+from dipdup.models import BigMapData
+from dipdup.models import BigMapDiff
+from dipdup.models import HeadBlockData
+from dipdup.models import IndexStatus
+from dipdup.models import OperationData
+from dipdup.models import Origination
+from dipdup.models import Transaction
+from dipdup.prometheus import Metrics
+from dipdup.utils import FormattedLogger
+from dipdup.utils.database import in_global_transaction
 
-# NOTE: Operations of a single contract call
-OperationSubgroup = namedtuple('OperationSubgroup', ('hash', 'counter'))
+_logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class OperationSubgroup:
+    """Operations of a single contract call"""
+
+    hash: str
+    counter: int
+    operations: Tuple[OperationData, ...]
+    entrypoints: Set[Optional[str]]
+
+    def __hash__(self) -> int:
+        return hash(f'{self.hash}:{self.counter}')
+
+
+# NOTE: Message queue of OperationIndex
+SingleLevelRollback = namedtuple('SingleLevelRollback', ('level'))
+Operations = Tuple[OperationData, ...]
+OperationQueueItemT = Union[Tuple[OperationSubgroup, ...], SingleLevelRollback]
+OperationHandlerArgumentT = Optional[Union[Transaction, Origination, OperationData]]
+MatchedOperationsT = Tuple[OperationSubgroup, OperationHandlerConfig, Deque[OperationHandlerArgumentT]]
+MatchedBigMapsT = Tuple[BigMapHandlerConfig, BigMapDiff]
+
+
+def extract_operation_subgroups(
+    operations: Iterable[OperationData],
+    addresses: Set[str],
+    entrypoints: Set[Optional[str]],
+) -> Iterator[OperationSubgroup]:
+    filtered: int = 0
+    levels: Set[int] = set()
+    operation_subgroups: DefaultDict[Tuple[str, int], Deque[OperationData]] = defaultdict(deque)
+
+    _operation_index = -1
+    for _operation_index, operation in enumerate(operations):
+        # NOTE: Filtering out operations that are not part of any index
+        if operation.type == 'transaction':
+            if operation.entrypoint not in entrypoints:
+                filtered += 1
+                continue
+            if operation.sender_address not in addresses and operation.target_address not in addresses:
+                filtered += 1
+                continue
+
+        key = (operation.hash, int(operation.counter))
+        operation_subgroups[key].append(operation)
+        levels.add(operation.level)
+
+    if len(levels) > 1:
+        raise RuntimeError
+
+    _logger.debug(
+        'Extracted %d subgroups (%d operations, %d filtered by %s entrypoints and %s addresses)',
+        len(operation_subgroups),
+        _operation_index + 1,
+        filtered,
+        len(entrypoints),
+        len(addresses),
+    )
+
+    for key, operations in operation_subgroups.items():
+        hash_, counter = key
+        entrypoints = {op.entrypoint for op in operations}
+        yield OperationSubgroup(
+            hash=hash_,
+            counter=counter,
+            operations=tuple(operations),
+            entrypoints=entrypoints,
+        )
 
 
 class Index:
+    """Base class for index implementations
+
+    Provides common interface for managing index state and switching between sync and realtime modes.
+    """
+
     _queue: Deque
 
-    def __init__(self, ctx: DipDupContext, config: IndexConfigTemplateT, datasource: TzktDatasource) -> None:
+    def __init__(self, ctx: DipDupContext, config: ResolvedIndexConfigT, datasource: TzktDatasource) -> None:
         self._ctx = ctx
         self._config = config
         self._datasource = datasource
 
         self._logger = FormattedLogger('dipdup.index', fmt=f'{config.name}: ' + '{}')
-        self._state: Optional[State] = None
+        self._state: Optional[models.Index] = None
 
     @property
     def datasource(self) -> TzktDatasource:
         return self._datasource
 
     @property
-    def state(self) -> State:
+    def state(self) -> models.Index:
         if self._state is None:
             raise RuntimeError('Index state is not initialized')
         return self._state
 
-    async def process(self) -> None:
-        await self._initialize_index_state()
+    @property
+    def queue_size(self) -> int:
+        return len(self._queue)
 
-        if self._config.last_block:
-            last_level = self._config.last_block
-            await self._synchronize(last_level, cache=True)
-        elif self._datasource.sync_level is None:
-            self._logger.info('Datasource is not active, sync to the latest block')
-            last_level = (await self._datasource.get_head_block()).level
-            await self._synchronize(last_level)
-        elif self._datasource.sync_level > self.state.level:
-            self._logger.info('Index is behind datasource, sync to datasource level')
+    @property
+    def synchronized(self) -> bool:
+        return self.state.status == IndexStatus.REALTIME
+
+    @property
+    def realtime(self) -> bool:
+        return self.state.status == IndexStatus.REALTIME and not self._queue
+
+    async def initialize_state(self, state: Optional[models.Index] = None) -> None:
+        if self._state:
+            raise RuntimeError('Index state is already initialized')
+
+        if state:
+            self._state = state
+            return
+
+        level = 0
+        if not isinstance(self._config, HeadIndexConfig):
+            level |= self._config.first_level
+
+        self._state, _ = await models.Index.get_or_create(
+            name=self._config.name,
+            type=self._config.kind,
+            defaults={
+                'level': level,
+                'config_hash': self._config.hash(),
+                'template': self._config.parent.name if self._config.parent else None,
+                'template_values': self._config.template_values,
+            },
+        )
+
+    async def process(self) -> None:
+        # NOTE: `--oneshot` flag implied
+        if isinstance(self._config, (OperationIndexConfig, BigMapIndexConfig)) and self._config.last_level:
+            last_level = self._config.last_level
+            with ExitStack() as stack:
+                if Metrics.enabled:
+                    stack.enter_context(Metrics.measure_total_sync_duration())
+                await self._synchronize(last_level, cache=True)
+            await self.state.update_status(IndexStatus.ONESHOT, last_level)
+
+        sync_levels = {self.datasource.get_sync_level(s) for s in self._config.subscriptions}
+        sync_level = sync_levels.pop()
+        if sync_levels:
+            raise RuntimeError(f'Multiple sync levels: {sync_levels}')
+        level = self.state.level
+
+        if sync_level is None:
+            raise RuntimeError('Call `set_sync_level` before starting IndexDispatcher')
+
+        elif level < sync_level:
+            self._logger.info('Index is behind datasource, sync to datasource level: %s -> %s', level, sync_level)
             self._queue.clear()
-            last_level = self._datasource.sync_level
-            await self._synchronize(last_level)
-        else:
-            await self._process_queue()
+
+            with ExitStack() as stack:
+                if Metrics.enabled:
+                    stack.enter_context(Metrics.measure_total_sync_duration())
+                await self._synchronize(sync_level)
+
+        elif self._queue:
+            with ExitStack() as stack:
+                if Metrics.enabled:
+                    stack.enter_context(Metrics.measure_total_realtime_duration())
+                await self._process_queue()
 
     @abstractmethod
     async def _synchronize(self, last_level: int, cache: bool = False) -> None:
@@ -76,53 +231,31 @@ class Index:
         ...
 
     async def _enter_sync_state(self, last_level: int) -> Optional[int]:
+        if self.state.status == IndexStatus.ONESHOT:
+            return None
+
         first_level = self.state.level
+
         if first_level == last_level:
             return None
         if first_level > last_level:
             raise RuntimeError(f'Attempt to synchronize index from level {first_level} to level {last_level}')
+
         self._logger.info('Synchronizing index to level %s', last_level)
-        self.state.hash = None  # type: ignore
-        await self.state.save()
+        await self.state.update_status(status=IndexStatus.SYNCING, level=first_level)
         return first_level
 
     async def _exit_sync_state(self, last_level: int) -> None:
         self._logger.info('Index is synchronized to level %s', last_level)
-        self.state.level = last_level  # type: ignore
-        await self.state.save()
+        if Metrics.enabled:
+            Metrics.set_levels_to_sync(self._config.name, 0)
+        await self.state.update_status(status=IndexStatus.REALTIME, level=last_level)
 
-    async def _initialize_index_state(self) -> None:
-        if self._state:
-            return
-        self._logger.info('Initializing index state')
-        index_config_hash = self._config.hash()
-        state = await State.get_or_none(
-            index_name=self._config.name,
-            index_type=self._config.kind,
-        )
-        if state is None:
-            state_cls = TemporaryState if self._config.stateless else State
-            state = state_cls(
-                index_name=self._config.name,
-                index_type=self._config.kind,
-                index_hash=index_config_hash,
-                level=self._config.first_block,
-            )
-
-        elif state.index_hash != index_config_hash:
-            self._logger.error('Config hash mismatch (config has been changed), reload from backup!')
-            # await self._ctx.reindex()
-
-        self._logger.info('%s', f'{state.level=} {state.hash=}'.replace('state.', ''))
-        # NOTE: No need to check indexes which are not synchronized.
-        if state.level and state.hash:
-            block = await self._datasource.get_block(state.level)
-            if state.hash != block.hash:
-                self._logger.error('Block hash mismatch (missed rollback while dipdup was stopped), reload from backup!')
-                # await self._ctx.reindex()
-
-        await state.save()
-        self._state = state
+    def _extract_level(self, message: Union[Tuple[OperationData, ...], Tuple[BigMapData, ...]]) -> int:
+        batch_levels = {item.level for item in message}
+        if len(batch_levels) != 1:
+            raise RuntimeError(f'Items in operation/big_map batch have different levels: {batch_levels}')
+        return batch_levels.pop()
 
 
 class OperationIndex(Index):
@@ -130,40 +263,55 @@ class OperationIndex(Index):
 
     def __init__(self, ctx: DipDupContext, config: OperationIndexConfig, datasource: TzktDatasource) -> None:
         super().__init__(ctx, config, datasource)
-        self._queue: Deque[Tuple[int, List[OperationData], Optional[HeadBlockData]]] = deque()
+        self._queue: Deque[OperationQueueItemT] = deque()
         self._contract_hashes: Dict[str, Tuple[int, int]] = {}
         self._rollback_level: Optional[int] = None
-        self._last_hashes: Set[str] = set()
+        self._head_hashes: Set[str] = set()
         self._migration_originations: Optional[Dict[str, OperationData]] = None
 
-    def push(self, level: int, operations: List[OperationData], block: Optional[HeadBlockData] = None) -> None:
-        self._queue.append((level, operations, block))
+    def push_operations(self, operation_subgroups: Tuple[OperationSubgroup, ...]) -> None:
+        self._queue.append(operation_subgroups)
+        if Metrics.enabled:
+            Metrics.set_levels_to_realtime(self._config.name, len(self._queue))
 
-    async def single_level_rollback(self, from_level: int) -> None:
-        """Ensure next arrived block is the same as rolled back one
+    def push_rollback(self, level: int) -> None:
+        self._queue.append(SingleLevelRollback(level))
 
-        Called by IndexDispatcher in case index datasource reported a rollback.
+    async def _single_level_rollback(self, level: int) -> None:
+        """Ensure next arrived block has all operations of the previous block. But it could also contain additional operations.
+
+        Called by IndexDispatcher when index datasource receive a single level rollback.
         """
         if self._rollback_level:
-            raise RuntimeError('Already in rollback state')
+            raise RuntimeError('Index is already in rollback state')
 
-        await self._initialize_index_state()
-        if self.state.level < from_level:
-            self._logger.info('Index level is lower than rollback level, ignoring')
-        elif self.state.level == from_level:
-            self._logger.info('Single level rollback has been triggered')
-            self._rollback_level = from_level
+        state_level = cast(int, self.state.level)
+        if state_level < level:
+            self._logger.info('Index level is lower than rollback level, ignoring: %s < %s', state_level, level)
+        elif state_level == level:
+            self._logger.info('Single level rollback, next block will be processed partially')
+            self._rollback_level = level
         else:
-            raise RuntimeError('Index level is higher than rollback level')
+            raise RuntimeError(f'Index level is higher than rollback level: {state_level} > {level}')
 
     async def _process_queue(self) -> None:
-        if not self._queue:
-            return
-        self._logger.info('Processing websocket queue')
-        with suppress(IndexError):
-            while True:
-                level, operations, block = self._queue.popleft()
-                await self._process_level_operations(level, operations, block)
+        """Process WebSocket queue"""
+        while self._queue:
+            message = self._queue.popleft()
+            messages_left = len(self._queue)
+            if Metrics.enabled:
+                Metrics.set_levels_to_realtime(self._config.name, messages_left)
+            if isinstance(message, SingleLevelRollback):
+                self._logger.debug('Processing rollback realtime message, %s left in queue', messages_left)
+                await self._single_level_rollback(message.level)
+            elif message:
+                self._logger.debug('Processing operations realtime message, %s left in queue', messages_left)
+                with ExitStack() as stack:
+                    if Metrics.enabled:
+                        stack.enter_context(Metrics.measure_level_realtime_duration())
+                    await self._process_level_operations(message)
+        else:
+            Metrics.set_levels_to_realtime(self._config.name, 0)
 
     async def _synchronize(self, last_level: int, cache: bool = False) -> None:
         """Fetch operations via Fetcher and pass to message callback"""
@@ -175,9 +323,9 @@ class OperationIndex(Index):
         transaction_addresses = await self._get_transaction_addresses()
         origination_addresses = await self._get_origination_addresses()
 
-        migration_originations = []
+        migration_originations: Tuple[OperationData, ...] = ()
         if self._config.types and OperationType.migration in self._config.types:
-            migration_originations = await self._datasource.get_migration_originations(first_level)
+            migration_originations = tuple(await self._datasource.get_migration_originations(first_level))
             for op in migration_originations:
                 code_hash, type_hash = await self._get_contract_hashes(cast(str, op.originated_contract_address))
                 op.originated_contract_code_hash, op.originated_contract_type_hash = code_hash, type_hash
@@ -193,55 +341,85 @@ class OperationIndex(Index):
         )
 
         async for level, operations in fetcher.fetch_operations_by_level():
-            await self._process_level_operations(level, operations)
+            if Metrics.enabled:
+                Metrics.set_levels_to_sync(self._config.name, last_level - level)
+
+            operation_subgroups = tuple(
+                extract_operation_subgroups(
+                    operations,
+                    entrypoints=self._config.entrypoint_filter,
+                    addresses=self._config.address_filter,
+                )
+            )
+            if operation_subgroups:
+                self._logger.info('Processing operations of level %s', level)
+                with ExitStack() as stack:
+                    if Metrics.enabled:
+                        stack.enter_context(Metrics.measure_level_sync_duration())
+                    await self._process_level_operations(operation_subgroups)
 
         await self._exit_sync_state(last_level)
 
-    async def _process_level_operations(self, level: int, operations: List[OperationData], block: Optional[HeadBlockData] = None) -> None:
-        if level < self.state.level:
-            raise RuntimeError(f'Level of operation batch is lower than index state level: {level} < {self.state.level}')
+    async def _process_level_operations(self, operation_subgroups: Tuple[OperationSubgroup, ...]) -> None:
+        if not operation_subgroups:
+            raise RuntimeError('No operations to process')
 
+        level = operation_subgroups[0].operations[0].level
         if self._rollback_level:
             levels = {
                 'operations': level,
                 'rollback': self._rollback_level,
                 'index': self.state.level,
-                'block': block.level if block else level,
             }
             if len(set(levels.values())) != 1:
                 levels_repr = ', '.join(f'{k}={v}' for k, v in levels.items())
                 raise RuntimeError(f'Index is in a rollback state, but received operation batch with different levels: {levels_repr}')
 
             self._logger.info('Rolling back to previous level, verifying processed operations')
-            expected_hashes = set(self._last_hashes)
-            received_hashes = set([op.hash for op in operations])
-            reused_hashes = received_hashes & expected_hashes
-            if reused_hashes != expected_hashes:
-                self._logger.error('Attempted a single level rollback, but arrived block differs from processed one, reload from backup!')
-                #await self._ctx.reindex()
+            received_hashes = {s.hash for s in operation_subgroups}
+            new_hashes = received_hashes - self._head_hashes
+            missing_hashes = self._head_hashes - received_hashes
+
+            self._logger.info('Comparing hashes: %s new, %s missing', len(new_hashes), len(missing_hashes))
+            if missing_hashes:
+                self._logger.info('Some operations were backtracked: %s', ', '.join(missing_hashes))
+                # TODO: More context
+                await self._ctx.reindex(ReindexingReason.rollback)
 
             self._rollback_level = None
-            self._last_hashes = set()
-            new_hashes = received_hashes - expected_hashes
-            if not new_hashes:
-                return
-            operations = [op for op in operations if op.hash in new_hashes]
+            self._head_hashes.clear()
+
+            operation_subgroups = tuple(filter(lambda subgroup: subgroup.hash in new_hashes, operation_subgroups))
+
+        elif level < self.state.level:
+            raise RuntimeError(f'Level of operation batch must be higher than index state level: {level} < {self.state.level}')
+
+        self._logger.debug('Processing %s operation subgroups of level %s', len(operation_subgroups), level)
+        matched_handlers: Deque[MatchedOperationsT] = deque()
+        for operation_subgroup in operation_subgroups:
+            self._head_hashes.add(operation_subgroup.hash)
+            matched_handlers += await self._match_operation_subgroup(operation_subgroup)
+
+        if Metrics.enabled:
+            Metrics.set_index_handlers_matched(len(matched_handlers))
+
+        # NOTE: We still need to bump index level but don't care if it will be done in existing transaction
+        if not matched_handlers:
+            await self.state.update_status(level=level)
+            return
 
         async with in_global_transaction():
-            self._logger.info('Processing %s operations of level %s', len(operations), level)
-            await self._process_operations(operations)
-
-            self.state.level = level  # type: ignore
-            if block:
-                self.state.hash = block.hash  # type: ignore
-            await self.state.save()
+            for operation_subgroup, handler_config, args in matched_handlers:
+                await self._call_matched_handler(handler_config, operation_subgroup, args)
+            await self.state.update_status(level=level)
 
     async def _match_operation(self, pattern_config: OperationHandlerPatternConfigT, operation: OperationData) -> bool:
         """Match single operation with pattern"""
         # NOTE: Reversed conditions are intentional
         if isinstance(pattern_config, OperationHandlerTransactionPatternConfig):
-            if pattern_config.entrypoint != operation.entrypoint:
-                return False
+            if pattern_config.entrypoint:
+                if pattern_config.entrypoint != operation.entrypoint:
+                    return False
             if pattern_config.destination:
                 if pattern_config.destination_contract_config.address != operation.target_address:
                     return False
@@ -269,91 +447,82 @@ class OperationIndex(Index):
         else:
             raise NotImplementedError
 
-    async def _process_operations(self, operations: List[OperationData]) -> None:
-        """Try to match operations in cache with all patterns from indexes. Must be wrapped in transaction."""
-        self._last_hashes = set()
-        operation_subgroups: Dict[OperationSubgroup, List[OperationData]] = defaultdict(list)
-        for operation in operations:
-            key = OperationSubgroup(operation.hash, operation.counter)
-            operation_subgroups[key].append(operation)
-            self._last_hashes.add(operation.hash)
+    async def _match_operation_subgroup(self, operation_subgroup: OperationSubgroup) -> Deque[MatchedOperationsT]:
+        """Try to match operation subgroup with all patterns from indexes."""
+        self._logger.debug('Matching %s', operation_subgroup)
+        matched_handlers: Deque[MatchedOperationsT] = deque()
+        operations = operation_subgroup.operations
 
-        for operation_subgroup, operations in operation_subgroups.items():
-            self._logger.debug('Matching %s', key)
+        for handler_config in self._config.handlers:
+            operation_idx = 0
+            pattern_idx = 0
+            matched_operations: Deque[Optional[OperationData]] = deque()
 
-            for handler_config in self._config.handlers:
-                operation_idx = 0
-                pattern_idx = 0
-                matched_operations: List[Optional[OperationData]] = []
+            # TODO: Ensure complex cases work, e.g. when optional argument is followed by required one
+            # TODO: Add None to matched_operations where applicable (pattern is optional and operation not found)
+            while operation_idx < len(operations):
+                operation, pattern_config = operations[operation_idx], handler_config.pattern[pattern_idx]
+                operation_matched = await self._match_operation(pattern_config, operation)
 
-                # TODO: Ensure complex cases work, for ex. required argument after optional one
-                # TODO: Add None to matched_operations where applicable (pattern is optional and operation not found)
-                while operation_idx < len(operations):
-                    operation, pattern_config = operations[operation_idx], handler_config.pattern[pattern_idx]
-                    operation_matched = await self._match_operation(pattern_config, operation)
+                if operation.type == 'origination' and isinstance(pattern_config, OperationHandlerOriginationPatternConfig):
 
-                    if operation.type == 'origination' and isinstance(pattern_config, OperationHandlerOriginationPatternConfig):
+                    if operation_matched is True and pattern_config.origination_processed(cast(str, operation.originated_contract_address)):
+                        operation_matched = False
 
-                        if operation_matched is True and pattern_config.origination_processed(
-                            cast(str, operation.originated_contract_address)
-                        ):
-                            operation_matched = False
+                if operation_matched:
+                    matched_operations.append(operation)
+                    pattern_idx += 1
+                    operation_idx += 1
+                elif pattern_config.optional:
+                    matched_operations.append(None)
+                    pattern_idx += 1
+                else:
+                    operation_idx += 1
 
-                    if operation_matched:
-                        matched_operations.append(operation)
-                        pattern_idx += 1
-                        operation_idx += 1
-                    elif pattern_config.optional:
-                        matched_operations.append(None)
-                        pattern_idx += 1
-                    else:
-                        operation_idx += 1
+                if pattern_idx == len(handler_config.pattern):
+                    self._logger.info('%s: `%s` handler matched!', operation_subgroup.hash, handler_config.callback)
 
-                    if pattern_idx == len(handler_config.pattern):
-                        await self._on_match(operation_subgroup, handler_config, matched_operations)
+                    args = await self._prepare_handler_args(handler_config, matched_operations)
+                    matched_handlers.append((operation_subgroup, handler_config, args))
 
-                        matched_operations = []
-                        pattern_idx = 0
+                    matched_operations.clear()
+                    pattern_idx = 0
 
-                if len(matched_operations) >= sum(map(lambda x: 0 if x.optional else 1, handler_config.pattern)):
-                    await self._on_match(operation_subgroup, handler_config, matched_operations)
+            if len(matched_operations) >= sum(map(lambda x: 0 if x.optional else 1, handler_config.pattern)):
+                self._logger.info('%s: `%s` handler matched!', operation_subgroup.hash, handler_config.callback)
 
-    async def _on_match(
+                args = await self._prepare_handler_args(handler_config, matched_operations)
+                matched_handlers.append((operation_subgroup, handler_config, args))
+
+        return matched_handlers
+
+    async def _prepare_handler_args(
         self,
-        operation_subgroup: OperationSubgroup,
         handler_config: OperationHandlerConfig,
-        matched_operations: List[Optional[OperationData]],
-    ):
-        """Prepare handler arguments, parse parameter and storage. Schedule callback in executor."""
-        self._logger.info('%s: `%s` handler matched!', operation_subgroup.hash, handler_config.callback)
-        start = time.perf_counter()
-
-        args: List[Optional[Union[Transaction, Origination, OperationData]]] = []
-        for pattern_config, operation in zip(handler_config.pattern, matched_operations):
-            if operation is None:
+        matched_operations: Deque[Optional[OperationData]],
+    ) -> Deque[OperationHandlerArgumentT]:
+        """Prepare handler arguments, parse parameter and storage."""
+        args: Deque[OperationHandlerArgumentT] = deque()
+        for pattern_config, operation_data in zip(handler_config.pattern, matched_operations):
+            if operation_data is None:
                 args.append(None)
 
             elif isinstance(pattern_config, OperationHandlerTransactionPatternConfig):
                 if not pattern_config.entrypoint:
-                    args.append(operation)
+                    args.append(operation_data)
                     continue
 
                 parameter_type = pattern_config.parameter_type_cls
                 try:
-                    parameter = parameter_type.parse_obj(operation.parameter_json) if parameter_type else None
+                    parameter = parameter_type.parse_obj(operation_data.parameter_json) if parameter_type else None
                 except ValidationError as e:
-                    error_context = dict(
-                        hash=operation.hash,
-                        counter=operation.counter,
-                        nonce=operation.nonce,
-                    )
-                    raise InvalidDataError(operation.parameter_json, parameter_type, error_context) from e
+                    raise InvalidDataError(parameter_type, operation_data.parameter_json, operation_data) from e
 
                 storage_type = pattern_config.storage_type_cls
-                storage = operation.get_merged_storage(storage_type)
+                storage = deserialize_storage(operation_data, storage_type)
 
                 transaction_context = Transaction(
-                    data=operation,
+                    data=operation_data,
                     parameter=parameter,
                     storage=storage,
                 )
@@ -361,10 +530,10 @@ class OperationIndex(Index):
 
             elif isinstance(pattern_config, OperationHandlerOriginationPatternConfig):
                 storage_type = pattern_config.storage_type_cls
-                storage = operation.get_merged_storage(storage_type)
+                storage = deserialize_storage(operation_data, storage_type)
 
                 origination_context = Origination(
-                    data=operation,
+                    data=operation_data,
                     storage=storage,
                 )
                 args.append(origination_context)
@@ -372,32 +541,27 @@ class OperationIndex(Index):
             else:
                 raise NotImplementedError
 
-        logger = FormattedLogger(
-            name=handler_config.callback,
-            fmt=operation_subgroup.hash + ': {}',
+        return args
+
+    async def _call_matched_handler(
+        self, handler_config: OperationHandlerConfig, operation_subgroup: OperationSubgroup, args: Sequence[OperationHandlerArgumentT]
+    ) -> None:
+        if not handler_config.parent:
+            raise ConfigInitializationException
+
+        await self._ctx.fire_handler(
+            handler_config.callback,
+            handler_config.parent.name,
+            self.datasource,
+            operation_subgroup.hash + ': {}',
+            *args,
         )
-        handler_context = HandlerContext(
-            datasources=self._ctx.datasources,
-            config=self._ctx.config,
-            logger=logger,
-            template_values=self._config.template_values,
-            datasource=self.datasource,
-            index_config=self._config,
-        )
-
-        await handler_config.callback_fn(handler_context, *args)
-
-        end = time.perf_counter()
-        self._logger.debug(f'{handler_config.callback}` handler executed in {end - start:.3f}s')
-
-        if handler_context.updated:
-            self._ctx.commit()
 
     async def _get_transaction_addresses(self) -> Set[str]:
         """Get addresses to fetch transactions from during initial synchronization"""
-        if self._config.types and OperationType.transaction not in self._config.types:
+        if OperationType.transaction not in self._config.types:
             return set()
-        return set(cast(ContractConfig, c).address for c in self._config.contracts or [])
+        return {contract.address for contract in self._config.contracts if isinstance(contract, ContractConfig)}
 
     async def _get_origination_addresses(self) -> Set[str]:
         """Get addresses to fetch origination from during initial synchronization"""
@@ -430,19 +594,24 @@ class BigMapIndex(Index):
 
     def __init__(self, ctx: DipDupContext, config: BigMapIndexConfig, datasource: TzktDatasource) -> None:
         super().__init__(ctx, config, datasource)
-        self._queue: Deque[Tuple[int, List[BigMapData], Optional[HeadBlockData]]] = deque()
+        self._queue: Deque[Tuple[BigMapData, ...]] = deque()
 
-    def push(self, level: int, big_maps: List[BigMapData], block: Optional[HeadBlockData] = None):
-        self._queue.append((level, big_maps, block))
+    def push_big_maps(self, big_maps: Tuple[BigMapData, ...]) -> None:
+        self._queue.append(big_maps)
 
-    async def _process_queue(self):
-        if not self._queue:
-            return
-        self._logger.info('Processing websocket queue')
-        with suppress(IndexError):
-            while True:
-                level, big_maps, block = self._queue.popleft()
-                await self._process_level_big_maps(level, big_maps, block)
+        if Metrics.enabled:
+            Metrics.set_levels_to_realtime(self._config.name, len(self._queue))
+
+    async def _process_queue(self) -> None:
+        """Process WebSocket queue"""
+        if self._queue:
+            self._logger.debug('Processing websocket queue')
+        while self._queue:
+            big_maps = self._queue.popleft()
+            with ExitStack() as stack:
+                if Metrics.enabled:
+                    stack.enter_context(Metrics.measure_level_realtime_duration())
+                await self._process_level_big_maps(big_maps)
 
     async def _synchronize(self, last_level: int, cache: bool = False) -> None:
         """Fetch operations via Fetcher and pass to message callback"""
@@ -450,10 +619,23 @@ class BigMapIndex(Index):
         if first_level is None:
             return
 
+        if any(
+            (
+                self._config.skip_history == SkipHistory.always,
+                self._config.skip_history == SkipHistory.once and not self.state.level,
+            )
+        ):
+            await self._synchronize_level(last_level, cache)
+        else:
+            await self._synchronize_full(first_level, last_level, cache)
+
+        await self._exit_sync_state(last_level)
+
+    async def _synchronize_full(self, first_level: int, last_level: int, cache: bool = False) -> None:
         self._logger.info('Fetching big map diffs from level %s to %s', first_level, last_level)
 
-        big_map_addresses = await self._get_big_map_addresses()
-        big_map_paths = await self._get_big_map_paths()
+        big_map_addresses = self._get_big_map_addresses()
+        big_map_paths = self._get_big_map_paths()
 
         fetcher = BigMapFetcher(
             datasource=self._datasource,
@@ -465,22 +647,73 @@ class BigMapIndex(Index):
         )
 
         async for level, big_maps in fetcher.fetch_big_maps_by_level():
-            await self._process_level_big_maps(level, big_maps)
+            with ExitStack() as stack:
+                if Metrics.enabled:
+                    Metrics.set_levels_to_sync(self._config.name, last_level - level)
+                    stack.enter_context(Metrics.measure_level_sync_duration())
+                await self._process_level_big_maps(big_maps)
 
-        await self._exit_sync_state(last_level)
+    async def _synchronize_level(self, last_level: int, cache: bool = False) -> None:
+        # NOTE: Checking late because feature flags could be modified after loading config
+        if not self._ctx.config.advanced.early_realtime:
+            raise ConfigurationError('`skip_history` requires `early_realtime` feature flag to be enabled')
 
-    async def _process_level_big_maps(self, level: int, big_maps: List[BigMapData], block: Optional[HeadBlockData] = None):
-        if level < self.state.level:
-            raise RuntimeError(f'Level of operation batch is lower than index state level: {level} < {self.state.level}')
+        big_map_pairs = self._get_big_map_pairs()
+        big_map_ids: Set[Tuple[int, str, str]] = set()
+
+        for address, path in big_map_pairs:
+            async for contract_big_maps in self._datasource.iter_contract_big_maps(address):
+                for contract_big_map in contract_big_maps:
+                    if contract_big_map['path'] == path:
+                        big_map_ids.add((int(contract_big_map['ptr']), address, path))
+
+        # NOTE: Do not use `_process_level_big_maps` here; we want to maintain transaction manually.
+        async with in_global_transaction():
+            for big_map_id, address, path in big_map_ids:
+                async for big_map_keys in self._datasource.iter_big_map(big_map_id, last_level):
+                    big_map_data = tuple(
+                        BigMapData(
+                            id=big_map_key['id'],
+                            level=last_level,
+                            operation_id=last_level,
+                            timestamp=datetime.now(),
+                            bigmap=big_map_id,
+                            contract_address=address,
+                            path=path,
+                            action=BigMapAction.ADD_KEY,
+                            active=big_map_key['active'],
+                            key=big_map_key['key'],
+                            value=big_map_key['value'],
+                        )
+                        for big_map_key in big_map_keys
+                    )
+                    matched_handlers = await self._match_big_maps(big_map_data)
+                    for handler_config, big_map_diff in matched_handlers:
+                        await self._call_matched_handler(handler_config, big_map_diff)
+
+            await self.state.update_status(level=last_level)
+
+    async def _process_level_big_maps(self, big_maps: Tuple[BigMapData, ...]) -> None:
+        if not big_maps:
+            return
+        level = self._extract_level(big_maps)
+
+        # NOTE: le operator because single level rollbacks are not supported
+        if level <= self.state.level:
+            raise RuntimeError(f'Level of big map batch must be higher than index state level: {level} <= {self.state.level}')
+
+        self._logger.debug('Processing big map diffs of level %s', level)
+        matched_handlers = await self._match_big_maps(big_maps)
+
+        # NOTE: We still need to bump index level but don't care if it will be done in existing transaction
+        if not matched_handlers:
+            await self.state.update_status(level=level)
+            return
 
         async with in_global_transaction():
-            self._logger.info('Processing %s big map diffs of level %s', len(big_maps), level)
-            await self._process_big_maps(big_maps)
-
-            self.state.level = level  # type: ignore
-            if block:
-                self.state.hash = block.hash  # type: ignore
-            await self.state.save()
+            for handler_config, big_map_diff in matched_handlers:
+                await self._call_matched_handler(handler_config, big_map_diff)
+            await self.state.update_status(level=level)
 
     async def _match_big_map(self, handler_config: BigMapHandlerConfig, big_map: BigMapData) -> bool:
         """Match single big map diff with pattern"""
@@ -490,21 +723,22 @@ class BigMapIndex(Index):
             return False
         return True
 
-    async def _on_match(
+    async def _prepare_handler_args(
         self,
         handler_config: BigMapHandlerConfig,
         matched_big_map: BigMapData,
-    ) -> None:
+    ) -> BigMapDiff:
         """Prepare handler arguments, parse key and value. Schedule callback in executor."""
         self._logger.info('%s: `%s` handler matched!', matched_big_map.operation_id, handler_config.callback)
-        start = time.perf_counter()
+        if not handler_config.parent:
+            raise ConfigInitializationException
 
         if matched_big_map.action.has_key:
             key_type = handler_config.key_type_cls
             try:
                 key = key_type.parse_obj(matched_big_map.key)
             except ValidationError as e:
-                raise InvalidDataError(matched_big_map.key, key_type) from e
+                raise InvalidDataError(key_type, matched_big_map.key, matched_big_map) from e
         else:
             key = None
 
@@ -513,57 +747,107 @@ class BigMapIndex(Index):
             try:
                 value = value_type.parse_obj(matched_big_map.value)
             except ValidationError as e:
-                raise InvalidDataError(matched_big_map.key, value_type) from e
+                raise InvalidDataError(value_type, matched_big_map.key, matched_big_map) from e
         else:
             value = None
 
-        big_map_context = BigMapDiff(  # type: ignore
+        return BigMapDiff(
             data=matched_big_map,
             action=matched_big_map.action,
             key=key,
             value=value,
         )
-        logger = FormattedLogger(
-            name=handler_config.callback,
-            fmt=str(matched_big_map.operation_id) + ': {}',
-        )
 
-        handler_context = HandlerContext(
-            datasources=self._ctx.datasources,
-            config=self._ctx.config,
-            logger=logger,
-            template_values=self._config.template_values,
-            datasource=self.datasource,
-            index_config=self._config,
-        )
-
-        await handler_config.callback_fn(handler_context, big_map_context)
-
-        end = time.perf_counter()
-        self._logger.debug(f'{handler_config.callback}` handler executed in {end - start:.3f}s')
-
-        if handler_context.updated:
-            self._ctx.commit()
-
-    async def _process_big_maps(self, big_maps: List[BigMapData]) -> None:
+    async def _match_big_maps(self, big_maps: Iterable[BigMapData]) -> Deque[MatchedBigMapsT]:
         """Try to match big map diffs in cache with all patterns from indexes."""
+        matched_handlers: Deque[MatchedBigMapsT] = deque()
 
-        for big_map in big_maps:
-            for handler_config in self._config.handlers:
+        for handler_config in self._config.handlers:
+            for big_map in big_maps:
                 big_map_matched = await self._match_big_map(handler_config, big_map)
                 if big_map_matched:
-                    await self._on_match(handler_config, big_map)
+                    arg = await self._prepare_handler_args(handler_config, big_map)
+                    matched_handlers.append((handler_config, arg))
 
-    async def _get_big_map_addresses(self) -> Set[str]:
-        """Get addresses to fetch transactions from during initial synchronization"""
+        return matched_handlers
+
+    async def _call_matched_handler(self, handler_config: BigMapHandlerConfig, big_map_diff: BigMapDiff) -> None:
+        if not handler_config.parent:
+            raise ConfigInitializationException
+
+        await self._ctx.fire_handler(
+            handler_config.callback,
+            handler_config.parent.name,
+            self.datasource,
+            # FIXME: missing `operation_id` field in API to identify operation
+            None,
+            big_map_diff,
+        )
+
+    def _get_big_map_addresses(self) -> Set[str]:
+        """Get addresses to fetch big map diffs from during initial synchronization"""
         addresses = set()
         for handler_config in self._config.handlers:
             addresses.add(cast(ContractConfig, handler_config.contract).address)
         return addresses
 
-    async def _get_big_map_paths(self) -> Set[str]:
-        """Get addresses to fetch transactions from during initial synchronization"""
+    def _get_big_map_paths(self) -> Set[str]:
+        """Get addresses to fetch big map diffs from during initial synchronization"""
         paths = set()
         for handler_config in self._config.handlers:
             paths.add(handler_config.path)
         return paths
+
+    def _get_big_map_pairs(self) -> Set[Tuple[str, str]]:
+        """Get address-path pairs for fetch big map diffs during sync with `skip_history`"""
+        pairs = set()
+        for handler_config in self._config.handlers:
+            pairs.add(
+                (
+                    cast(ContractConfig, handler_config.contract).address,
+                    handler_config.path,
+                )
+            )
+        return pairs
+
+
+class HeadIndex(Index):
+    _config: HeadIndexConfig
+
+    def __init__(self, ctx: DipDupContext, config: HeadIndexConfig, datasource: TzktDatasource) -> None:
+        super().__init__(ctx, config, datasource)
+        self._queue: Deque[HeadBlockData] = deque()
+
+    async def _synchronize(self, last_level: int, cache: bool = False) -> None:
+        self._logger.info('Setting index level to %s and moving on', last_level)
+        await self.state.update_status(status=IndexStatus.REALTIME, level=last_level)
+
+    async def _process_queue(self) -> None:
+        while self._queue:
+            head = self._queue.popleft()
+            self._logger.debug('Processing head realtime message, %s left in queue', len(self._queue))
+
+            level = head.level
+            if level <= self.state.level:
+                raise RuntimeError(f'Level of head must be higher than index state level: {level} <= {self.state.level}')
+
+            async with in_global_transaction():
+                self._logger.debug('Processing head info of level %s', level)
+                for handler_config in self._config.handlers:
+                    await self._call_matched_handler(handler_config, head)
+                await self.state.update_status(level=level)
+
+    async def _call_matched_handler(self, handler_config: HeadHandlerConfig, head: HeadBlockData) -> None:
+        if not handler_config.parent:
+            raise ConfigInitializationException
+
+        await self._ctx.fire_handler(
+            handler_config.callback,
+            handler_config.parent.name,
+            self.datasource,
+            head.hash,
+            head,
+        )
+
+    def push_head(self, head: HeadBlockData) -> None:
+        self._queue.append(head)

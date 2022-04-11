@@ -1,16 +1,22 @@
-import logging
-from copy import deepcopy
+from dataclasses import field
 from datetime import datetime
 from decimal import Decimal
 from enum import Enum
-from typing import Any, Dict, Generic, List, Optional, Type, TypeVar
+from typing import Any
+from typing import Dict
+from typing import Generic
+from typing import Optional
+from typing import Tuple
+from typing import TypeVar
 
 from pydantic import BaseModel
 from pydantic.dataclasses import dataclass
-from pydantic.error_wrappers import ValidationError
-from tortoise import Model, fields
+from tortoise import Model
+from tortoise import fields
 
-from dipdup.exceptions import ConfigurationError, InvalidDataError
+from dipdup.enums import IndexStatus
+from dipdup.enums import IndexType
+from dipdup.enums import ReindexingReason
 
 ParameterType = TypeVar('ParameterType', bound=BaseModel)
 StorageType = TypeVar('StorageType', bound=BaseModel)
@@ -18,57 +24,22 @@ KeyType = TypeVar('KeyType', bound=BaseModel)
 ValueType = TypeVar('ValueType', bound=BaseModel)
 
 
-_logger = logging.getLogger('dipdup.models')
-
-
-class IndexType(Enum):
-    operation = 'operation'
-    big_map = 'big_map'
-    block = 'block'
-    schema = 'schema'
-
-
-class State(Model):
-    """Stores current level of index and hash of it's config"""
-
-    index_name = fields.CharField(256, pk=True)
-    index_type = fields.CharEnumField(IndexType)
-    index_hash = fields.CharField(256)
-    level = fields.IntField(default=0)
-    hash = fields.CharField(64, null=True)
-
-    class Meta:
-        table = 'dipdup_state'
-
-
-# TODO: Drop `stateless` option
-class TemporaryState(State):
-    """Used within stateless indexes, skip saving to DB"""
-
-    async def save(self, using_db=None, update_fields=None, force_create=False, force_update=False) -> None:
-        pass
-
-    class Meta:
-        abstract = True
-
-
 @dataclass
 class OperationData:
-    """Basic structure for operations from TzKT response"""
-
     type: str
     id: int
     level: int
     timestamp: datetime
     hash: str
     counter: int
-    sender_address: str
+    sender_address: Optional[str]
     target_address: Optional[str]
     initiator_address: Optional[str]
     amount: Optional[int]
     status: str
     has_internals: Optional[bool]
-    storage: Dict[str, Any]
+    storage: Any
+    diffs: Tuple[Dict[str, Any], ...] = field(default_factory=tuple)
     block: Optional[str] = None
     sender_alias: Optional[str] = None
     nonce: Optional[int] = None
@@ -80,88 +51,8 @@ class OperationData:
     originated_contract_alias: Optional[str] = None
     originated_contract_type_hash: Optional[int] = None
     originated_contract_code_hash: Optional[int] = None
-    diffs: Optional[List[Dict[str, Any]]] = None
-
-    # TODO: refactor this class -> move merge/process methods away
-    def _merge_bigmapdiffs(self, storage_dict: Dict[str, Any], bigmap_name: str, array: bool) -> None:
-        """Apply big map diffs of specific path to storage"""
-        if self.diffs is None:
-            raise Exception('`bigmaps` field missing')
-        _logger.debug(bigmap_name)
-        bigmapdiffs = [bm for bm in self.diffs if bm['path'] == bigmap_name]
-        bigmap_key = bigmap_name.split('.')[-1]
-        for diff in bigmapdiffs:
-            _logger.debug('Applying bigmapdiff: %s', diff)
-            if diff['action'] in ('add_key', 'update_key'):
-                key = diff['content']['key']
-                if array is True:
-                    storage_dict[bigmap_key].append({'key': key, 'value': diff['content']['value']})
-                else:
-                    storage_dict[bigmap_key][key] = diff['content']['value']
-
-    def _process_storage(
-        self,
-        storage_type: Type[StorageType],
-        storage: Dict[str, Any],
-        prefix: str = None,
-    ) -> Dict[str, Any]:
-        for key, field in storage_type.__fields__.items():
-
-            if key == '__root__':
-                continue
-
-            if field.alias:
-                key = field.alias
-
-            bigmap_name = key if prefix is None else f'{prefix}.{key}'
-
-            # NOTE: TzKT could return bigmaps as object or as array of key-value objects. We need to guess this from storage.
-            # TODO: This code should be a part of datasource module.
-            try:
-                value = storage[key]
-            except KeyError as e:
-                if not field.required:
-                    continue
-                raise ConfigurationError(f'Type `{storage_type.__name__}` is invalid: `{key}` field does not exists') from e
-
-            # FIXME: Pydantic bug. `BaseModel.type_` returns incorrect value when annotation is Dict[str, bool]
-            if field.type_ != field.outer_type_ and field.type_ == bool:
-                annotation = field.outer_type_
-            else:
-                annotation = field.type_
-
-            if annotation not in (int, bool) and isinstance(value, int):
-                if hasattr(annotation, '__fields__') and 'key' in annotation.__fields__ and 'value' in annotation.__fields__:
-                    storage[key] = []
-                    if self.diffs:
-                        self._merge_bigmapdiffs(storage, bigmap_name, array=True)
-                else:
-                    storage[key] = {}
-                    if self.diffs:
-                        self._merge_bigmapdiffs(storage, bigmap_name, array=False)
-            elif hasattr(annotation, '__fields__') and isinstance(storage[key], dict):
-                storage[key] = self._process_storage(annotation, storage[key], bigmap_name)
-
-        return storage
-
-    def get_merged_storage(self, storage_type: Type[StorageType]) -> StorageType:
-        """Merge big map diffs and deserialize raw storage into typeclass"""
-        if self.storage is None:
-            raise Exception('`storage` field missing')
-
-        storage = deepcopy(self.storage)
-        _logger.debug('Merging storage')
-        _logger.debug('Before: %s', storage)
-        _logger.debug('Diffs: %s', self.diffs)
-
-        storage = self._process_storage(storage_type, storage, None)
-
-        _logger.debug('After: %s', storage)
-
-        try:
-            return storage_type.parse_obj(storage)
-        except ValidationError as e:
-            raise InvalidDataError(storage, storage_type) from e
+    delegate_address: Optional[str] = None
+    delegate_alias: Optional[str] = None
 
 
 @dataclass
@@ -211,13 +102,14 @@ class BigMapData:
     contract_address: str
     path: str
     action: BigMapAction
+    active: bool
     key: Optional[Any] = None
     value: Optional[Any] = None
 
 
 @dataclass
 class BigMapDiff(Generic[KeyType, ValueType]):
-    """Wrapper for every big map diff in each list of handler arguments"""
+    """Wrapper for every big map diff in handler arguments"""
 
     action: BigMapAction
     data: BigMapData
@@ -227,7 +119,7 @@ class BigMapDiff(Generic[KeyType, ValueType]):
 
 @dataclass
 class BlockData:
-    """Basic structure for blocks from TzKT response"""
+    """Basic structure for blocks from TzKT HTTP response"""
 
     level: int
     hash: str
@@ -245,10 +137,15 @@ class BlockData:
 
 @dataclass
 class HeadBlockData:
+    """Basic structure for head block from TzKT SignalR response"""
+
+    chain: str
+    chain_id: str
     cycle: int
     level: int
     hash: str
     protocol: str
+    next_protocol: str
     timestamp: datetime
     voting_epoch: int
     voting_period: int
@@ -263,3 +160,112 @@ class HeadBlockData:
     quote_jpy: Decimal
     quote_krw: Decimal
     quote_eth: Decimal
+    quote_gbp: Decimal
+
+
+@dataclass
+class QuoteData:
+    """Basic structure for quotes from TzKT HTTP response"""
+
+    level: int
+    timestamp: datetime
+    btc: Decimal
+    eur: Decimal
+    usd: Decimal
+    cny: Decimal
+    jpy: Decimal
+    krw: Decimal
+    eth: Decimal
+
+
+class Schema(Model):
+    name = fields.CharField(256, pk=True)
+    hash = fields.CharField(256)
+    reindex = fields.CharEnumField(ReindexingReason, max_length=40, null=True)
+
+    created_at = fields.DatetimeField(auto_now_add=True)
+    updated_at = fields.DatetimeField(auto_now=True)
+
+    class Meta:
+        table = 'dipdup_schema'
+
+
+class Head(Model):
+    name = fields.CharField(256, pk=True)
+    level = fields.IntField()
+    hash = fields.CharField(64)
+    timestamp = fields.DatetimeField()
+
+    created_at = fields.DatetimeField(auto_now_add=True)
+    updated_at = fields.DatetimeField(auto_now=True)
+
+    class Meta:
+        table = 'dipdup_head'
+
+
+class Index(Model):
+    name = fields.CharField(256, pk=True)
+    type = fields.CharEnumField(IndexType)
+    status = fields.CharEnumField(IndexStatus, default=IndexStatus.NEW)
+
+    config_hash = fields.CharField(256)
+    template = fields.CharField(256, null=True)
+    template_values = fields.JSONField(null=True)
+
+    level = fields.IntField(default=0)
+
+    created_at = fields.DatetimeField(auto_now_add=True)
+    updated_at = fields.DatetimeField(auto_now=True)
+
+    async def update_status(
+        self,
+        status: Optional[IndexStatus] = None,
+        level: Optional[int] = None,
+    ) -> None:
+        self.status = status or self.status
+        self.level = level or self.level  # type: ignore
+        await self.save()
+
+    class Meta:
+        table = 'dipdup_index'
+
+
+class Contract(Model):
+    name = fields.CharField(256, pk=True)
+    address = fields.CharField(256)
+    typename = fields.CharField(256, null=True)
+
+    created_at = fields.DatetimeField(auto_now_add=True)
+    updated_at = fields.DatetimeField(auto_now=True)
+
+    class Meta:
+        table = 'dipdup_contract'
+
+
+class ContractMetadata(Model):
+    network = fields.CharField(51)
+    contract = fields.CharField(36)
+    metadata = fields.JSONField()
+    update_id = fields.IntField()
+
+    created_at = fields.DatetimeField(auto_now_add=True)
+    updated_at = fields.DatetimeField(auto_now=True)
+
+    class Meta:
+        table = 'dipdup_contract_metadata'
+        unique_together = ('network', 'contract')
+
+
+class TokenMetadata(Model):
+    network = fields.CharField(51)
+    contract = fields.CharField(36)
+    token_id = fields.TextField()
+    metadata = fields.JSONField()
+    update_id = fields.IntField()
+
+    created_at = fields.DatetimeField(auto_now_add=True)
+    updated_at = fields.DatetimeField(auto_now=True)
+
+    class Meta:
+        table = 'dipdup_token_metadata'
+        unique_together = ('network', 'contract', 'token_id')
