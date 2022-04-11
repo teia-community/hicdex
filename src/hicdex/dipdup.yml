@@ -215,4 +215,3 @@ indexes:
         pattern:
           - type: origination
             similar_to: SPLIT_contract_sample_d
-    stateless: True
