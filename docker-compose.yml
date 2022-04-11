@@ -11,6 +11,7 @@ services:
       - ./src/hicdex/dipdup-docker.yml:/home/dipdup/dipdup-docker.yml
       - ./data/hicdex-metadata:/home/dipdup/metadata
     command: ["-c", "dipdup.yml", "-c", "dipdup-docker.yml", "run"]
+    #command: ["schema", "approve"]
     restart: always
     environment:
       - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-changeme}
@@ -46,7 +47,7 @@ services:
       - db
     restart: always
     environment:
-      - HASURA_GRAPHQL_DATABASE_URL=postgres://dipdup:${POSTGRES_PASSWORD:-changeme}@db:5432/dipdup
+      - HASURA_GRAPHQL_DATABASE_URL=postgres://dipdup:${POSTGRES_PASSWORD:-changeme}@db:5432/public
       - HASURA_GRAPHQL_ENABLE_CONSOLE=true
       - HASURA_GRAPHQL_ENABLED_LOG_TYPES=startup, http-log, webhook-log, websocket-log, query-log
       - HASURA_GRAPHQL_ADMIN_SECRET=${ADMIN_SECRET:-changeme}
