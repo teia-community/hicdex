@@ -131,7 +131,11 @@ def _apply_bigmap_diffs(
     else:
         dict_storage: Dict[str, Any] = {}
         for key, value in diffs_items:
-            dict_storage[key] = value
+            # FIX BIKER: ignore invalid keys
+            try:
+                dict_storage[key] = value
+            except TypeError:
+                pass
         return dict_storage
 
 
