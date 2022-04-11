@@ -69,14 +69,14 @@ class TokenOperator(Model):
         table = 'token_operator'
 
 
-class Tag(Model):
+class TagModel(Model):
     id = fields.BigIntField(pk=True)
     tag = fields.CharField(255)
 
 
 class TokenTag(Model):
     token = fields.ForeignKeyField('models.Token', 'token_tags', null=False, index=True)
-    tag = fields.ForeignKeyField('models.Tag', 'tag_tokens', null=False, index=True)
+    tag = fields.ForeignKeyField('models.TagModel', 'tag_tokens', null=False, index=True)
 
     class Meta:
         table = 'token_tag'

@@ -56,7 +56,7 @@ async def add_tags(token, metadata):
 
 
 async def get_or_create_tag(tag):
-    tag, _ = await models.Tag.get_or_create(tag=tag)
+    tag, _ = await models.TagModel.get_or_create(tag=tag)
     return tag
 
 
