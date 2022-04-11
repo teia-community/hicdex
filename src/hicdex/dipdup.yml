@@ -65,6 +65,7 @@ datasources:
   tzkt_mainnet:
     kind: tzkt
     url: https://api.tzkt.io
+    buffer_size: 2
 
 indexes:
   hen_mainnet:
