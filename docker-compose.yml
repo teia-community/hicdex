@@ -73,7 +73,7 @@ services:
       - POSTGRES_DB=dipdup
       - POSTGRES_USER=dipdup
       - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-changeme}
-      - POSTGRES_EXTRA_OPTS=-Z6 --clean --schema=hic_et_nunc --blobs
+      - POSTGRES_EXTRA_OPTS=-Z6 --clean --schema=public --blobs
       - SCHEDULE=*/30 * * * *
       - BACKUP_KEEP_DAYS=7
       - BACKUP_KEEP_WEEKS=4
