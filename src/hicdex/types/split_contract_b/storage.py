@@ -19,10 +19,10 @@ class SplitContractBStorage(BaseModel):
     minterAddress: str
     proposedAdministrator: Optional[str]
     registryAddress: str
-    residuals: Optional[str]
+    residuals: str
     shares: Dict[str, str]
-    threshold: Optional[str]
+    threshold: str
     tokenAddress: str
-    totalReceived: Optional[str]
+    totalReceived: str
     totalShares: str
-    undistributed: Optional[Dict[str, str]]
+    undistributed: Dict[str, str]
