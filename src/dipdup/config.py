@@ -40,6 +40,7 @@ from typing_extensions import Literal
 
 from dipdup.datasources.metadata.enums import MetadataNetwork
 from dipdup.datasources.subscription import BigMapSubscription
+from dipdup.datasources.subscription import HeadSubscription
 from dipdup.datasources.subscription import OriginationSubscription
 from dipdup.datasources.subscription import Subscription
 from dipdup.datasources.subscription import TransactionSubscription
@@ -1069,7 +1070,7 @@ default_hooks = {
     'on_rollback': HookConfig(
         callback='on_rollback',
         args={
-            'datasource': 'dipdup.datasources.datasource.Datasource',
+            'datasource': 'dipdup.datasources.datasource.IndexDatasource',
             'from_level': 'int',
             'to_level': 'int',
         },
@@ -1371,11 +1372,14 @@ class DipDupConfig:
         if isinstance(index_config, OperationIndexConfig):
             if self.advanced.merge_subscriptions:
                 index_config.subscriptions.add(TransactionSubscription())
-            else:
-                for contract_config in index_config.contracts:
-                    if not isinstance(contract_config, ContractConfig):
-                        raise ConfigInitializationException
-                    index_config.subscriptions.add(TransactionSubscription(address=contract_config.address))
+                return
+
+            if not index_config.contracts:
+                raise ConfigurationError('`OperationIndexConfig.contracts` must be set when `merge_subscriptions` flag is disabled')
+            for contract_config in index_config.contracts:
+                if not isinstance(contract_config, ContractConfig):
+                    raise ConfigInitializationException
+                index_config.subscriptions.add(TransactionSubscription(address=contract_config.address))
 
             for handler_config in index_config.handlers:
                 for pattern_config in handler_config.pattern:
@@ -1386,14 +1390,14 @@ class DipDupConfig:
         elif isinstance(index_config, BigMapIndexConfig):
             if self.advanced.merge_subscriptions:
                 index_config.subscriptions.add(BigMapSubscription())
-            else:
-                for big_map_handler_config in index_config.handlers:
-                    address, path = big_map_handler_config.contract_config.address, big_map_handler_config.path
-                    index_config.subscriptions.add(BigMapSubscription(address=address, path=path))
+                return
 
-        # NOTE: HeadSubscription is always enabled
+            for big_map_handler_config in index_config.handlers:
+                address, path = big_map_handler_config.contract_config.address, big_map_handler_config.path
+                index_config.subscriptions.add(BigMapSubscription(address=address, path=path))
+
         elif isinstance(index_config, HeadIndexConfig):
-            pass
+            index_config.subscriptions.add(HeadSubscription())
 
         else:
             raise NotImplementedError(f'Index kind `{index_config.kind}` is not supported')
