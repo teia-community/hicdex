@@ -36,7 +36,7 @@ test:           ## Run test suite
 	poetry run pytest --cov-report=term-missing --cov=hicdex --cov-report=xml -n auto --dist loadscope -s -v tests
 
 cover:          ## Print coverage for the current branch
-	poetry run diff-cover coverage.xml
+	poetry run diff-cover coverage.xml --compare-branch=origin/main
 
 build:          ## Build wheel Python package
 	poetry build
