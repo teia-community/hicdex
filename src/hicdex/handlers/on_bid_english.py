@@ -1,8 +1,9 @@
 from datetime import timedelta
 
-import hicdex.models as models
 from dipdup.context import HandlerContext
 from dipdup.models import Transaction
+
+import hicdex.models as models
 from hicdex.types.objktbid_english.parameter.bid import BidParameter
 from hicdex.types.objktbid_english.storage import ObjktbidEnglishStorage
 

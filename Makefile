@@ -1,13 +1,11 @@
-## ==> DipDup makefile
+## ==> hicdex makefile
 .ONESHELL:
-.PHONY: test build docs
+.PHONY: test build
 .DEFAULT_GOAL: all
 
 ##
 ## DEV=1           Install dev dependencies
 DEV=1
-## PLUGINS=""      Install extras (`pytezos` only)
-PLUGINS=""
 ## TAG=latest      Docker tag for images built
 TAG=latest
 ##
@@ -17,7 +15,6 @@ all:            ## Run a whole CI pipeline (default)
 
 install:        ## Install project
 	poetry install \
-	`if [ -n "${PLUGINS}" ]; then for i in ${PLUGINS}; do echo "-E $$i "; done; fi` \
 	`if [ "${DEV}" = "0" ]; then echo "--no-dev"; fi`
 
 lint:           ## Lint with all tools
@@ -36,7 +33,7 @@ mypy:           ## Lint with mypy
 	poetry run mypy src tests
 
 test:           ## Run test suite
-	poetry run pytest --cov-report=term-missing --cov=dipdup --cov-report=xml -n auto --dist loadscope -s -v tests
+	poetry run pytest --cov-report=term-missing --cov=hicdex --cov-report=xml -n auto --dist loadscope -s -v tests
 
 cover:          ## Print coverage for the current branch
 	poetry run diff-cover coverage.xml
@@ -45,8 +42,7 @@ build:          ## Build wheel Python package
 	poetry build
 
 image:          ## Build Docker image
-	docker build . -t dipdup:${TAG}
-	docker build . -t dipdup:${TAG}-pytezos --build-arg PLUGINS=pytezos
+	docker build . -t hicdex:${TAG}
 
 release-patch:  ## Release patch version
 	bumpversion patch
@@ -62,9 +58,6 @@ release-major:  ## Release major version
 	bumpversion major
 	git push --tags
 	git push
-
-docs:           ## Build config/CLI references and copy to ../dipdup-docs
-	cd docs; rm -r _build; make install
 
 help:           ## Show this help
 	@fgrep -h "##" $(MAKEFILE_LIST) | fgrep -v fgrep | sed -e 's/\\$$//' | sed -e 's/##//'

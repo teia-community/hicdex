@@ -1,6 +1,7 @@
-import hicdex.models as models
 from dipdup.context import HandlerContext
 from dipdup.models import Origination
+
+import hicdex.models as models
 from hicdex.types.split_contract_a.storage import SplitContractAStorage
 
 

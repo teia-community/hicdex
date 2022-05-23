@@ -1,6 +1,7 @@
-import hicdex.models as models
 from dipdup.context import HandlerContext
 from dipdup.models import Transaction
+
+import hicdex.models as models
 from hicdex.types.hen_objkts.parameter.transfer import TransferParameter
 from hicdex.types.hen_objkts.storage import HenObjktsStorage
 

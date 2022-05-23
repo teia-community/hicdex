@@ -1,6 +1,7 @@
-import hicdex.models as models
 from dipdup.context import HandlerContext
 from dipdup.models import Transaction
+
+import hicdex.models as models
 from hicdex.types.objktbid_marketplace.parameter.fulfill_bid import FulfillBidParameter
 from hicdex.types.objktbid_marketplace.storage import ObjktbidMarketplaceStorage
 

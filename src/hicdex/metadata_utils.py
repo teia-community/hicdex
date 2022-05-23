@@ -17,9 +17,8 @@ broken_ids = []
 try:
     with open(f'{METADATA_PATH}/broken.json') as broken_list:
         broken_ids = json.load(broken_list)
-except:
-    print(f'Unable to load {METADATA_PATH}/broken.json')
-    pass
+except Exception as exc:
+    _logger.error(f'Unable to load {METADATA_PATH}/broken.json: %s', exc)
 
 
 async def fix_token_metadata(token):
@@ -37,9 +36,7 @@ async def fix_token_metadata(token):
 
 
 async def fix_other_metadata():
-    async for token in models.Token.filter(
-        Q(artifact_uri='') & ~Q(id__in=broken_ids)
-    ).order_by('id'):
+    async for token in models.Token.filter(Q(artifact_uri='') & ~Q(id__in=broken_ids)).order_by('id'):
         fixed = await fix_token_metadata(token)
         if fixed:
             _logger.info(f'fixed metadata for {token.id}')
@@ -73,9 +70,7 @@ async def get_subjkt_metadata(holder):
     except Exception:
         pass
 
-    data = await fetch_subjkt_metadata_cf_ipfs(holder, failed_attempt)
-
-    return data
+    return await fetch_subjkt_metadata_cf_ipfs(holder, failed_attempt)
 
 
 async def get_metadata(token):
@@ -103,7 +98,7 @@ async def get_metadata(token):
 
 
 def normalize_metadata(token, metadata):
-    n = {
+    return {
         '__version': 1,
         'token_id': token.id,
         'symbol': metadata.get('symbol', 'OBJKT'),
@@ -118,8 +113,6 @@ def normalize_metadata(token, metadata):
         'tags': metadata.get('tags', []),
         'extra': {},
     }
-
-    return n
 
 
 def write_subjkt_metadata_file(holder, metadata):

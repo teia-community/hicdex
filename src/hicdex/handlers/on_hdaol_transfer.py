@@ -1,6 +1,7 @@
-import hicdex.models as models
 from dipdup.context import HandlerContext
 from dipdup.models import Transaction
+
+import hicdex.models as models
 from hicdex.types.hdao_ledger.parameter.transfer import TransferParameter
 from hicdex.types.hdao_ledger.storage import HdaoLedgerStorage
 

@@ -1,6 +1,7 @@
-import hicdex.models as models
 from dipdup.context import HandlerContext
 from dipdup.models import Transaction
+
+import hicdex.models as models
 from hicdex.types.hen_minter.parameter.collect import CollectParameter
 from hicdex.types.hen_minter.storage import HenMinterStorage
 
@@ -9,7 +10,7 @@ async def on_collect(
     ctx: HandlerContext,
     collect: Transaction[CollectParameter, HenMinterStorage],
 ) -> None:
-    swap = await models.Swap.filter(id=collect.parameter.swap_id,contract_address=collect.data.target_address).get()
+    swap = await models.Swap.filter(id=collect.parameter.swap_id, contract_address=collect.data.target_address).get()
     seller = await swap.creator
     buyer, _ = await models.Holder.get_or_create(address=collect.data.sender_address)
     token = await swap.token.get()  # type: ignore

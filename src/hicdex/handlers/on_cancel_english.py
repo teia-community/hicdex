@@ -1,6 +1,7 @@
-import hicdex.models as models
 from dipdup.context import HandlerContext
 from dipdup.models import Transaction
+
+import hicdex.models as models
 from hicdex.types.objktbid_english.parameter.cancel_auction import CancelAuctionParameter
 from hicdex.types.objktbid_english.storage import ObjktbidEnglishStorage
 

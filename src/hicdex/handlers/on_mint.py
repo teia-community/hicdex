@@ -1,6 +1,7 @@
-import hicdex.models as models
 from dipdup.context import HandlerContext
 from dipdup.models import Transaction
+
+import hicdex.models as models
 from hicdex.metadata_utils import fix_other_metadata, fix_token_metadata
 from hicdex.types.hen_minter.parameter.mint_objkt import MintOBJKTParameter
 from hicdex.types.hen_minter.storage import HenMinterStorage

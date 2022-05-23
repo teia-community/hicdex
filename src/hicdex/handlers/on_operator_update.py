@@ -1,6 +1,7 @@
-import hicdex.models as models
 from dipdup.context import HandlerContext
 from dipdup.models import Transaction
+
+import hicdex.models as models
 from hicdex.types.hen_objkts.parameter.update_operators import (
     UpdateOperatorsParameter,
     UpdateOperatorsParameterItem,
@@ -33,5 +34,5 @@ async def on_operator_update(
                 operator = data_remove.operator
                 token_operator = await models.TokenOperator.filter(token=token, owner=owner, operator=operator).get()
                 await token_operator.delete()
-        except:
-            pass
+        except Exception as exc:
+            ctx.logger.error('Failed to update token %s: %s', token.id, exc)

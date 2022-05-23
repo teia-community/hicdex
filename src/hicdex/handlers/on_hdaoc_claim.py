@@ -1,6 +1,7 @@
-import hicdex.models as models
 from dipdup.context import HandlerContext
 from dipdup.models import Transaction
+
+import hicdex.models as models
 from hicdex.types.hdao_curation.parameter.claim_h_dao import ClaimHDAOParameter
 from hicdex.types.hdao_curation.storage import HdaoCurationStorage
 

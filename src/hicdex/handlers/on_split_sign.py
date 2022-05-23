@@ -1,6 +1,7 @@
-import hicdex.models as models
 from dipdup.context import HandlerContext
 from dipdup.models import Transaction
+
+import hicdex.models as models
 from hicdex.types.split_sign.parameter.sign import SignParameter
 from hicdex.types.split_sign.storage import SplitSignStorage
 
@@ -28,5 +29,5 @@ async def on_split_sign(
         if sig_required.issubset(sig_created):
             token.is_signed = True  # type: ignore
             await token.save()
-    except:
-        return
+    except Exception as exc:
+        ctx.logger.error('Failed to update token %s: %s', token.id, exc)

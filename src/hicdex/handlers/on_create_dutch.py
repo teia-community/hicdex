@@ -1,8 +1,8 @@
-from hashids import Hashids
-
-import hicdex.models as models
 from dipdup.context import HandlerContext
 from dipdup.models import Transaction
+from hashids import Hashids  # type: ignore
+
+import hicdex.models as models
 from hicdex.types.objktbid_dutch.parameter.create_auction import CreateAuctionParameter
 from hicdex.types.objktbid_dutch.storage import ObjktbidDutchStorage
 

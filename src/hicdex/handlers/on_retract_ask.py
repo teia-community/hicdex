@@ -1,6 +1,7 @@
-import hicdex.models as models
 from dipdup.context import HandlerContext
 from dipdup.models import Transaction
+
+import hicdex.models as models
 from hicdex.types.objktbid_marketplace.parameter.retract_ask import RetractAskParameter
 from hicdex.types.objktbid_marketplace.storage import ObjktbidMarketplaceStorage
 

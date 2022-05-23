@@ -1,6 +1,7 @@
-import hicdex.models as models
 from dipdup.context import HandlerContext
 from dipdup.models import Transaction
+
+import hicdex.models as models
 from hicdex.metadata_utils import fix_other_metadata, fix_token_metadata
 from hicdex.types.hen_swap_v2.parameter.swap import SwapParameter
 from hicdex.types.hen_swap_v2.storage import HenSwapV2Storage
