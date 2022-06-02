@@ -1,4 +1,3 @@
 FROM dipdup/dipdup:5.1
-
-COPY pyproject.toml poetry.lock ./
+COPY . .
 RUN inject_pyproject

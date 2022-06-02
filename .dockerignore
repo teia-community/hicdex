@@ -1,0 +1,16 @@
+# Ignore all
+*
+
+# Add build files
+!Makefile
+!pyproject.toml
+!poetry.lock
+!README.md
+!inject_pyproject.sh
+
+# Add code
+!src/hicdex
+
+# Ignore caches
+**/.mypy_cache
+**/__pycache__
