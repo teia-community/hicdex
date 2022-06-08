@@ -25,4 +25,4 @@ class SplitSignStorageItem(BaseModel):
 
 
 class SplitSignStorage(BaseModel):
-    __root__: Dict[str, Any]
+    __root__: List[SplitSignStorageItem]

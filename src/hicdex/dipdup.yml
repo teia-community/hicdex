@@ -5,6 +5,7 @@ advanced:
   early_realtime: True
   reindex:
     manual: ignore
+    schema_modified: ignore
     
 database:
   kind: sqlite
