@@ -18,8 +18,11 @@ async def on_create_english(
     ctx: HandlerContext,
     create_auction: Transaction[CreateAuctionParameter, ObjktbidEnglishStorage],
 ) -> None:
+    if create_auction.data.target_address is None:
+        raise RuntimeError(f'{create_auction.data.hash}: `target_address` is None')
+
     auction_id = int(create_auction.storage.auction_id) - 1
-    version = CONTRACT_VERSION.get(create_auction.data.target_address, -1)  # type: ignore
+    version = CONTRACT_VERSION.get(create_auction.data.target_address, -1)
     fa2, _ = await models.FA2.get_or_create(contract=create_auction.parameter.fa2)
     creator, _ = await models.Holder.get_or_create(address=create_auction.data.sender_address)
 
@@ -28,7 +31,7 @@ async def on_create_english(
         artist, _ = await models.Holder.get_or_create(address=create_auction.parameter.artist)
 
     auction_model = models.EnglishAuction(
-        id=auction_id,  # type: ignore
+        id=auction_id,
         hash=hashids.encode(auction_id),
         fa2=fa2,
         status=models.AuctionStatus.ACTIVE,

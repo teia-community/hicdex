@@ -14,7 +14,7 @@ async def on_hdaol_transfer(
         sender, _ = await models.Holder.get_or_create(address=t.from_)
         for tx in t.txs:
             receiver, _ = await models.Holder.get_or_create(address=tx.to_)
-            sender.hdao_balance -= int(tx.amount)  # type: ignore
-            receiver.hdao_balance += int(tx.amount)  # type: ignore
+            sender.hdao_balance -= int(tx.amount)
+            receiver.hdao_balance += int(tx.amount)
             await receiver.save()
         await sender.save()

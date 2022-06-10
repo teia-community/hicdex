@@ -1,7 +1,7 @@
 from datetime import datetime
 from enum import Enum, IntEnum
 
-from tortoise import Model, fields
+from tortoise import ForeignKeyFieldInstance, Model, fields
 
 
 class SwapStatus(IntEnum):
@@ -16,6 +16,10 @@ class ShareholderStatus(str, Enum):
     benefactor = 'benefactor'
 
 
+class FA2(Model):
+    contract = fields.CharField(36, pk=True)
+
+
 class Holder(Model):
     address = fields.CharField(36, pk=True)
     name = fields.TextField(default='')
@@ -27,21 +31,23 @@ class Holder(Model):
 
 
 class SplitContract(Model):
-    contract = fields.ForeignKeyField('models.Holder', 'shares', index=True)
+    contract: ForeignKeyFieldInstance[Holder] = fields.ForeignKeyField('models.Holder', 'shares', index=True)
     administrator = fields.CharField(36, null=True)
     total_shares = fields.BigIntField(null=True)
 
 
 class Shareholder(Model):
-    split_contract = fields.ForeignKeyField('models.SplitContract', 'shareholder', index=True)
-    holder = fields.ForeignKeyField('models.Holder', 'shareholder', index=True)
+    split_contract: ForeignKeyFieldInstance[Holder] = fields.ForeignKeyField('models.SplitContract', 'shareholder', index=True)
+    holder: ForeignKeyFieldInstance[Holder] = fields.ForeignKeyField('models.Holder', 'shareholder', index=True)
     shares = fields.BigIntField()
     holder_type = fields.CharEnumField(ShareholderStatus, default=ShareholderStatus.unspecified)
+
+    holder_id: str
 
 
 class Token(Model):
     id = fields.BigIntField(pk=True)
-    creator = fields.ForeignKeyField('models.Holder', 'tokens', index=True, null=True)
+    creator: ForeignKeyFieldInstance[Holder] = fields.ForeignKeyField('models.Holder', 'tokens', index=True, null=True)
     title = fields.TextField(default='')
     description = fields.TextField(default='')
     artifact_uri = fields.TextField(default='')
@@ -58,10 +64,12 @@ class Token(Model):
     level = fields.BigIntField(default=0)
     timestamp = fields.DatetimeField(default=datetime.utcnow())
 
+    creator_id: str
+
 
 class TokenOperator(Model):
-    token = fields.ForeignKeyField('models.Token', 'operators', null=False, index=True)
-    owner = fields.ForeignKeyField('models.Holder', 'owner', index=True)
+    token: ForeignKeyFieldInstance[Token] = fields.ForeignKeyField('models.Token', 'operators', null=False, index=True)
+    owner: ForeignKeyFieldInstance[Holder] = fields.ForeignKeyField('models.Holder', 'owner', index=True)
     operator = fields.CharField(36)
     level = fields.BigIntField()
 
@@ -75,16 +83,16 @@ class TagModel(Model):
 
 
 class TokenTag(Model):
-    token = fields.ForeignKeyField('models.Token', 'token_tags', null=False, index=True)
-    tag = fields.ForeignKeyField('models.TagModel', 'tag_tokens', null=False, index=True)
+    token: ForeignKeyFieldInstance[Token] = fields.ForeignKeyField('models.Token', 'token_tags', null=False, index=True)
+    tag: ForeignKeyFieldInstance[TagModel] = fields.ForeignKeyField('models.TagModel', 'tag_tokens', null=False, index=True)
 
     class Meta:
         table = 'token_tag'
 
 
 class TokenHolder(Model):
-    holder = fields.ForeignKeyField('models.Holder', 'holders_token', null=False, index=True)
-    token = fields.ForeignKeyField('models.Token', 'token_holders', null=False, index=True)
+    holder: ForeignKeyFieldInstance[Holder] = fields.ForeignKeyField('models.Holder', 'holders_token', null=False, index=True)
+    token: ForeignKeyFieldInstance[Token] = fields.ForeignKeyField('models.Token', 'token_holders', null=False, index=True)
     quantity = fields.BigIntField(default=0)
 
     class Meta:
@@ -92,8 +100,10 @@ class TokenHolder(Model):
 
 
 class Signatures(Model):
-    token = fields.ForeignKeyField('models.Token', 'token_signatures', null=False, index=True)
-    holder = fields.ForeignKeyField('models.Holder', 'holder_signatures', null=False, index=True)
+    token: ForeignKeyFieldInstance[Token] = fields.ForeignKeyField('models.Token', 'token_signatures', null=False, index=True)
+    holder: ForeignKeyFieldInstance[Holder] = fields.ForeignKeyField('models.Holder', 'holder_signatures', null=False, index=True)
+
+    holder_id: str
 
     class Meta:
         table = 'split_signatures'
@@ -102,14 +112,14 @@ class Signatures(Model):
 
 class Swap(Model):
     id = fields.BigIntField(index=True)
-    creator = fields.ForeignKeyField('models.Holder', 'swaps', index=True)
-    token = fields.ForeignKeyField('models.Token', 'swaps', index=True)
+    creator: ForeignKeyFieldInstance[Holder] = fields.ForeignKeyField('models.Holder', 'swaps', index=True)
+    token: ForeignKeyFieldInstance[Token] = fields.ForeignKeyField('models.Token', 'swaps', index=True)
     price = fields.BigIntField()
     amount = fields.SmallIntField()
     amount_left = fields.SmallIntField()
     status = fields.IntEnumField(SwapStatus)
     royalties = fields.SmallIntField()
-    fa2 = fields.ForeignKeyField('models.FA2', 'swaps', index=True)
+    fa2: ForeignKeyFieldInstance[FA2] = fields.ForeignKeyField('models.FA2', 'swaps', index=True)
     contract_address = fields.CharField(36, index=True)
     contract_version = fields.SmallIntField()
     is_valid = fields.BooleanField(default=True)
@@ -122,10 +132,10 @@ class Swap(Model):
 
 class Trade(Model):
     id = fields.BigIntField(pk=True)
-    token = fields.ForeignKeyField('models.Token', 'trades', index=True)
-    swap = fields.ForeignKeyField('models.Swap', 'trades', index=True)
-    seller = fields.ForeignKeyField('models.Holder', 'sales', index=True)
-    buyer = fields.ForeignKeyField('models.Holder', 'purchases', index=True)
+    token: ForeignKeyFieldInstance[Token] = fields.ForeignKeyField('models.Token', 'trades', index=True)
+    swap: ForeignKeyFieldInstance[Swap] = fields.ForeignKeyField('models.Swap', 'trades', index=True)
+    seller: ForeignKeyFieldInstance[Holder] = fields.ForeignKeyField('models.Holder', 'sales', index=True)
+    buyer: ForeignKeyFieldInstance[Holder] = fields.ForeignKeyField('models.Holder', 'purchases', index=True)
     amount = fields.BigIntField()
 
     ophash = fields.CharField(51)
@@ -144,18 +154,14 @@ class AuctionStatus(str, Enum):
     CONCLUDED = 'concluded'
 
 
-class FA2(Model):
-    contract = fields.CharField(36, pk=True)
-
-
 class EnglishAuction(Model):
     id = fields.BigIntField(pk=True)
     hash = fields.CharField(55, index=True)
-    fa2 = fields.ForeignKeyField('models.FA2', 'english_auctions', index=True)
+    fa2: ForeignKeyFieldInstance[FA2] = fields.ForeignKeyField('models.FA2', 'english_auctions', index=True)
     status = fields.CharEnumField(AuctionStatus)
     objkt_id = fields.BigIntField(index=True)
-    creator = fields.ForeignKeyField('models.Holder', 'created_english_auctions', index=True)
-    artist = fields.ForeignKeyField('models.Holder', 'starring_english_auctions', index=True)
+    creator: ForeignKeyFieldInstance[Holder] = fields.ForeignKeyField('models.Holder', 'created_english_auctions', index=True)
+    artist: ForeignKeyFieldInstance[Holder] = fields.ForeignKeyField('models.Holder', 'starring_english_auctions', index=True)
     royalties = fields.BigIntField()
     start_time = fields.DatetimeField()
     end_time = fields.DatetimeField()
@@ -176,9 +182,9 @@ class EnglishAuction(Model):
 
 class EnglishBid(Model):
     id = fields.BigIntField(pk=True)
-    bidder = fields.ForeignKeyField('models.Holder', 'english_bids', index=True)
+    bidder: ForeignKeyFieldInstance[Holder] = fields.ForeignKeyField('models.Holder', 'english_bids', index=True)
     amount = fields.BigIntField()
-    auction = fields.ForeignKeyField('models.EnglishAuction', 'bids', index=True)
+    auction: ForeignKeyFieldInstance[EnglishAuction] = fields.ForeignKeyField('models.EnglishAuction', 'bids', index=True)
 
     level = fields.BigIntField()
     timestamp = fields.DatetimeField()
@@ -190,17 +196,17 @@ class EnglishBid(Model):
 class DutchAuction(Model):
     id = fields.BigIntField(pk=True)
     hash = fields.CharField(55, index=True)
-    fa2 = fields.ForeignKeyField('models.FA2', 'dutch_auctions', index=True)
+    fa2: ForeignKeyFieldInstance[FA2] = fields.ForeignKeyField('models.FA2', 'dutch_auctions', index=True)
     status = fields.CharEnumField(AuctionStatus)
     objkt_id = fields.BigIntField(index=True)
-    creator = fields.ForeignKeyField('models.Holder', 'created_dutch_auctions', index=True)
-    artist = fields.ForeignKeyField('models.Holder', 'starring_dutch_auctions', index=True)
+    creator: ForeignKeyFieldInstance[Holder] = fields.ForeignKeyField('models.Holder', 'created_dutch_auctions', index=True)
+    artist: ForeignKeyFieldInstance[Holder] = fields.ForeignKeyField('models.Holder', 'starring_dutch_auctions', index=True)
     royalties = fields.BigIntField()
     start_time = fields.DatetimeField()
     end_time = fields.DatetimeField()
     start_price = fields.BigIntField()
     end_price = fields.BigIntField()
-    buyer = fields.ForeignKeyField('models.Holder', 'won_dutch_auctions', index=True, null=True)
+    buyer: ForeignKeyFieldInstance[Holder] = fields.ForeignKeyField('models.Holder', 'won_dutch_auctions', index=True, null=True)
     buy_price = fields.BigIntField(null=True)
     contract_version = fields.SmallIntField()
 
@@ -216,14 +222,14 @@ class DutchAuction(Model):
 
 class Bid(Model):
     id = fields.BigIntField(pk=True)
-    creator = fields.ForeignKeyField('models.Holder', 'bids', index=True)
-    artist = fields.ForeignKeyField('models.Holder', 'starring_bids', index=True)
+    creator: ForeignKeyFieldInstance[Holder] = fields.ForeignKeyField('models.Holder', 'bids', index=True)
+    artist: ForeignKeyFieldInstance[Holder] = fields.ForeignKeyField('models.Holder', 'starring_bids', index=True)
     objkt_id = fields.BigIntField(index=True)
-    fa2 = fields.ForeignKeyField('models.FA2', 'bids', index=True)
+    fa2: ForeignKeyFieldInstance[FA2] = fields.ForeignKeyField('models.FA2', 'bids', index=True)
     price = fields.BigIntField()
     royalties = fields.BigIntField()
     status = fields.CharEnumField(AuctionStatus)
-    seller = fields.ForeignKeyField('models.Holder', 'sold_bids', index=True, null=True)
+    seller: ForeignKeyFieldInstance[Holder] = fields.ForeignKeyField('models.Holder', 'sold_bids', index=True, null=True)
 
     level = fields.BigIntField()
     timestamp = fields.DatetimeField()
@@ -234,10 +240,10 @@ class Bid(Model):
 
 class Ask(Model):
     id = fields.BigIntField(pk=True)
-    creator = fields.ForeignKeyField('models.Holder', 'asks', index=True)
-    artist = fields.ForeignKeyField('models.Holder', 'starring_asks', index=True)
+    creator: ForeignKeyFieldInstance[Holder] = fields.ForeignKeyField('models.Holder', 'asks', index=True)
+    artist: ForeignKeyFieldInstance[Holder] = fields.ForeignKeyField('models.Holder', 'starring_asks', index=True)
     objkt_id = fields.BigIntField(index=True)
-    fa2 = fields.ForeignKeyField('models.FA2', 'asks', index=True)
+    fa2: ForeignKeyFieldInstance[FA2] = fields.ForeignKeyField('models.FA2', 'asks', index=True)
     price = fields.BigIntField()
     royalties = fields.BigIntField()
     amount = fields.BigIntField()
@@ -254,9 +260,9 @@ class Ask(Model):
 class FulfilledAsk(Model):
     id = fields.BigIntField(pk=True)
     objkt_id = fields.BigIntField(index=True)
-    ask = fields.ForeignKeyField('models.Ask', 'fulfilled', index=True)
-    seller = fields.ForeignKeyField('models.Holder', 'sold_asks', index=True)
-    buyer = fields.ForeignKeyField('models.Holder', 'bought_asks', index=True)
+    ask: ForeignKeyFieldInstance[Ask] = fields.ForeignKeyField('models.Ask', 'fulfilled', index=True)
+    seller: ForeignKeyFieldInstance[Holder] = fields.ForeignKeyField('models.Holder', 'sold_asks', index=True)
+    buyer: ForeignKeyFieldInstance[Holder] = fields.ForeignKeyField('models.Holder', 'bought_asks', index=True)
     amount = fields.BigIntField()
 
     level = fields.BigIntField()

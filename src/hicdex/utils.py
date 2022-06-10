@@ -1,5 +1,6 @@
 import json
 import logging
+from contextlib import suppress
 
 import aiohttp
 
@@ -14,15 +15,13 @@ def clean_null_bytes(string: str) -> str:
 
 
 def fromhex(hexbytes: str) -> str:
-    string = ''
-    try:
-        string = bytes.fromhex(hexbytes).decode()
-    except Exception:
+    string = None
+    with suppress(Exception):
         try:
-            string = bytes.fromhex(hexbytes).decode('latin-1')
+            string = bytes.fromhex(hexbytes).decode()
         except Exception:
-            pass
-    return clean_null_bytes(string)
+            string = bytes.fromhex(hexbytes).decode('latin-1')
+    return clean_null_bytes(string or '')
 
 
 async def http_request(session: aiohttp.ClientSession, method: str, **kwargs):

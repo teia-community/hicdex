@@ -1,9 +1,9 @@
 import json
 import logging
+from contextlib import suppress
 from pathlib import Path
 
 import aiohttp
-from tortoise.query_utils import Q
 
 import hicdex.models as models
 from hicdex.utils import clean_null_bytes, http_request
@@ -59,32 +59,26 @@ async def get_or_create_tag(tag):
 
 async def get_subjkt_metadata(holder):
     failed_attempt = 0
-    try:
-        with open(subjkt_path(holder.address)) as json_file:
-            metadata = json.load(json_file)
-            failed_attempt = metadata.get('__failed_attempt')
-            if failed_attempt and failed_attempt > 1:
-                return {}
-            if not failed_attempt:
-                return metadata
-    except Exception:
-        pass
+    with suppress(Exception), open(subjkt_path(holder.address)) as json_file:
+        metadata = json.load(json_file)
+        failed_attempt = metadata.get('__failed_attempt')
+        if failed_attempt and failed_attempt > 1:
+            return {}
+        if not failed_attempt:
+            return metadata
 
     return await fetch_subjkt_metadata_cf_ipfs(holder, failed_attempt)
 
 
 async def get_metadata(token):
     failed_attempt = 0
-    try:
-        with open(file_path(token.id)) as json_file:
-            metadata = json.load(json_file)
-            failed_attempt = metadata.get('__failed_attempt')
-            if failed_attempt and failed_attempt > 1:
-                return {}
-            if not failed_attempt:
-                return metadata
-    except Exception:
-        pass
+    with suppress(Exception), open(file_path(token.id)) as json_file:
+        metadata = json.load(json_file)
+        failed_attempt = metadata.get('__failed_attempt')
+        if failed_attempt and failed_attempt > 1:
+            return {}
+        if not failed_attempt:
+            return metadata
 
     data = await fetch_metadata_cf_ipfs(token, failed_attempt)
     if data != {}:

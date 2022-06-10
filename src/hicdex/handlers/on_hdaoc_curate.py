@@ -11,5 +11,5 @@ async def on_hdaoc_curate(
     curate: Transaction[CurateParameter, HdaoCurationStorage],
 ) -> None:
     token = await models.Token.filter(id=int(curate.parameter.objkt_id)).get()
-    token.hdao_balance += int(curate.parameter.hDAO_amount)  # type: ignore
+    token.hdao_balance += int(curate.parameter.hDAO_amount)
     await token.save()

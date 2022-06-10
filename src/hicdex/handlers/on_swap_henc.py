@@ -16,10 +16,10 @@ async def on_swap_henc(
     swap_id = int(swap.storage.counter) - 1
     fa2, _ = await models.FA2.get_or_create(contract=swap.parameter.fa2)
 
-    is_valid = swap.parameter.creator == token.creator_id and int(swap.parameter.royalties) == int(token.royalties)  # type: ignore
+    is_valid = swap.parameter.creator == token.creator_id and int(swap.parameter.royalties) == int(token.royalties)
 
     swap_model = models.Swap(
-        id=swap_id,  # type: ignore
+        id=swap_id,
         creator=holder,
         token=token,
         price=swap.parameter.xtz_per_objkt,

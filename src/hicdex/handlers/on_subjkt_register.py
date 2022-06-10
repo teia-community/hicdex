@@ -24,9 +24,9 @@ async def on_subjkt_register(
     metadata_file = fromhex(registry.parameter.metadata)
     metadata: Dict[str, str] = {}
 
-    holder.name = name  # type: ignore
-    holder.metadata_file = metadata_file  # type: ignore
-    holder.metadata = metadata  # type: ignore
+    holder.name = name
+    holder.metadata_file = metadata_file
+    holder.metadata = metadata
 
     try:
         if metadata_file.startswith('ipfs://'):
@@ -35,6 +35,6 @@ async def on_subjkt_register(
     except Exception as exc:
         ctx.logger.error('Failed to fetch metadata for %s: %s', holder.address, exc)
 
-    holder.description = holder.metadata.get('description', '')  # type: ignore
+    holder.description = holder.metadata.get('description', '')
 
     await holder.save()

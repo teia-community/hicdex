@@ -13,7 +13,7 @@ async def on_collect_henc(
     swap = await models.Swap.filter(id=int(collect.parameter.__root__), contract_address=collect.data.target_address).get()
     seller = await swap.creator
     buyer, _ = await models.Holder.get_or_create(address=collect.data.sender_address)
-    token = await swap.token.get()  # type: ignore
+    token = await swap.token.get()
 
     trade = models.Trade(
         swap=swap,
@@ -27,7 +27,7 @@ async def on_collect_henc(
     )
     await trade.save()
 
-    swap.amount_left -= 1  # type: ignore
+    swap.amount_left -= 1
     if swap.amount_left == 0:
         swap.status = models.SwapStatus.FINISHED
     await swap.save()

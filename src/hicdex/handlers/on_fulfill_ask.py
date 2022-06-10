@@ -10,7 +10,7 @@ async def on_fulfill_ask(
     ctx: HandlerContext,
     fulfill_ask: Transaction[FulfillAskParameter, ObjktbidMarketplaceStorage],
 ) -> None:
-    ask = await models.Ask.filter(id=fulfill_ask.parameter.__root__).get().prefetch_related('creator')  # type: ignore
+    ask: models.Ask = await models.Ask.filter(id=fulfill_ask.parameter.__root__).get().prefetch_related('creator')
     buyer, _ = await models.Holder.get_or_create(address=fulfill_ask.data.sender_address)
 
     fulfilled_ask = models.FulfilledAsk(
@@ -24,9 +24,9 @@ async def on_fulfill_ask(
     )
     await fulfilled_ask.save()
 
-    ask.amount_left -= 1  # type: ignore
+    ask.amount_left -= 1
     if ask.amount_left == 0:
         ask.status = models.AuctionStatus.CONCLUDED
-        ask.update_level = fulfill_ask.data.level  # type: ignore
-        ask.update_timestamp = fulfill_ask.data.timestamp  # type: ignore
+        ask.update_level = fulfill_ask.data.level
+        ask.update_timestamp = fulfill_ask.data.timestamp
     await ask.save()
