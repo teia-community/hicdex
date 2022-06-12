@@ -1,15 +1,18 @@
 import json
 import logging
+import os
 from contextlib import suppress
 from pathlib import Path
 
 import aiohttp
+from tortoise.expressions import Q
 
 import hicdex.models as models
 from hicdex.utils import clean_null_bytes, http_request
 
 METADATA_PATH = '/home/dipdup/metadata/tokens'
 SUBJKT_PATH = '/home/dipdup/metadata/subjkts'
+IPFS_API = os.environ.get('IPFS_API', 'https://cloudflare-ipfs.com/ipfs/')
 
 _logger = logging.getLogger(__name__)
 
@@ -146,7 +149,7 @@ async def fetch_subjkt_metadata_cf_ipfs(holder, failed_attempt=0):
     addr = holder.metadata_file.replace('ipfs://', '')
     try:
         session = aiohttp.ClientSession()
-        data = await http_request(session, 'get', url=f'https://cloudflare-ipfs.com/ipfs/{addr}', timeout=10)
+        data = await http_request(session, 'get', url=f'{IPFS_API}/{addr}', timeout=10)
         await session.close()
         if data and not isinstance(data, list):
             write_subjkt_metadata_file(holder, data)
@@ -162,7 +165,7 @@ async def fetch_metadata_cf_ipfs(token, failed_attempt=0):
     addr = token.metadata.replace('ipfs://', '')
     try:
         session = aiohttp.ClientSession()
-        data = await http_request(session, 'get', url=f'https://cloudflare-ipfs.com/ipfs/{addr}', timeout=10)
+        data = await http_request(session, 'get', url=f'{IPFS_API}/{addr}', timeout=10)
         await session.close()
         if data and not isinstance(data, list):
             write_metadata_file(token, data)
