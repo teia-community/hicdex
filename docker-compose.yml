@@ -6,9 +6,8 @@ services:
     depends_on:
       - db
     volumes:
-      - ./src/hicdex:/home/dipdup/source/src/hicdex
-      - ./src/hicdex/dipdup.yml:/home/dipdup/dipdup.yml
-      - ./src/hicdex/dipdup-docker.yml:/home/dipdup/dipdup-docker.yml
+      - ./dipdup.yml:/home/dipdup/dipdup.yml
+      - ./dipdup-docker.yml:/home/dipdup/dipdup-docker.yml
       - ./data/hicdex-metadata:/home/dipdup/metadata
     command: ["-c", "dipdup.yml", "-c", "dipdup-docker.yml", "run"]
     #command: ["schema", "approve"]
@@ -38,7 +37,7 @@ services:
       retries: 5
 
   hasura:
-    image: hasura/graphql-engine:latest
+    image: hasura/graphql-engine:v2.4.0
     # ports:
     #   - 8081:8080
     expose:
