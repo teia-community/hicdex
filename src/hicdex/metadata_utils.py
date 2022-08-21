@@ -35,6 +35,8 @@ async def fix_token_metadata(ctx: DipDupContext, token: models.Token) -> bool:
     token.formats = metadata.get('formats', {})
     token.language = get_language(metadata)
     token.attributes = metadata.get('attributes', {})
+    if token.attributes is None:
+        token.attributes = {}
     token.content_rating = get_content_rating(metadata)
     token.accessibility = metadata.get('accessibility', {})
     await add_tags(token, metadata)
