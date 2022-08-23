@@ -7,5 +7,3 @@ async def on_restart(
     ctx: HookContext,
 ) -> None:
     await ctx.execute_sql('on_restart')
-    await fix_holder_metadata(ctx)
-    await fix_other_metadata(ctx)

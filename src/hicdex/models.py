@@ -77,6 +77,7 @@ class Token(Model):
 
     accessibility = fields.JSONField(default={})
     content_rating = fields.TextField(default='')
+    minting_tool = fields.TextField(default='')
 
 
 class TokenOperator(Model):

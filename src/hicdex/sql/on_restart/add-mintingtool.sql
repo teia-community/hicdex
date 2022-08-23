@@ -1,0 +1,1 @@
+ALTER TABLE token ADD COLUMN IF NOT EXISTS minting_tool TEXT;
