@@ -31,6 +31,7 @@ async def fix_token_metadata(ctx: DipDupContext, token: models.Token) -> bool:
     token.mime = get_mime(metadata)
     token.extra = metadata.get('extra', {})
     token.rights = get_rights(metadata)
+    token.minting_tool = get_minting_tool(metadata)
     token.right_uri = get_right_uri(metadata)
     token.formats = metadata.get('formats', {})
     token.language = get_language(metadata)
@@ -226,3 +227,7 @@ def get_thumbnail_uri(metadata: Dict[str, Any]) -> str:
 
 def get_right_uri(metadata: Dict[str, Any]) -> str:
     return clean_null_bytes(metadata.get('right_uri', '') or metadata.get('rightUri', ''))
+
+
+def get_minting_tool(metadata: Dict[str, Any]) -> str:
+    return clean_null_bytes(metadata.get('minting_tool', '') or metadata.get('mintingTool', ''))
